@@ -187,6 +187,43 @@ class EwsClient {
   }
 
   /**
+   * Resolves the mailbox's own SMTP address against Active Directory,
+   * needed because the username typed into settings may be `DOMAIN\user`
+   * rather than an email address, and Thunderbird's native meeting-
+   * response UI (Accept/Tentative/Decline) needs to know the account's
+   * own address to recognize "this event invites me" — see
+   * calendar/provider.js's registerCalendar(). Returns null (not thrown)
+   * on any failure or ambiguous match; that just means the invitation UI
+   * won't activate, which is a silent feature gap, not a sync failure.
+   *
+   * ResolveNames request/response shape (attribute order, SearchScope
+   * value, ResolutionSet/Resolution/Mailbox nesting) verified against
+   * ResolveNamesRequest.cs / NameResolution.cs in ews-managed-api.
+   */
+  async resolveOwnEmail(username) {
+    if (username.includes("@")) {
+      return username;
+    }
+    try {
+      const body =
+        `<m:ResolveNames ReturnFullContactData="false" SearchScope="ActiveDirectory">` +
+        `<m:UnresolvedEntry>${escapeXml(username)}</m:UnresolvedEntry>` +
+        `</m:ResolveNames>`;
+      const doc = await this.soapRequest(body);
+      this.assertSuccess(doc, "ResolveNames");
+      const resolutions = doc.getElementsByTagNameNS(TYPES_NS, "Resolution");
+      if (resolutions.length !== 1) {
+        return null; // no match, or ambiguous — can't be sure which is "me"
+      }
+      const mailbox = resolutions[0].getElementsByTagNameNS(TYPES_NS, "Mailbox")[0];
+      return mailbox ? text(mailbox, "EmailAddress") : null;
+    } catch (e) {
+      console.error("exchangeCalendar: could not resolve own email via ResolveNames", e);
+      return null;
+    }
+  }
+
+  /**
    * Incrementally syncs a calendar folder. Pass the syncState saved from a
    * previous call to get only what changed since; omit it for an initial
    * full sync. Call repeatedly while `moreAvailable` is true.

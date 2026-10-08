@@ -90,9 +90,14 @@ async function connectAccount(url, username, password) {
   // call used to, but this result is actually useful (the folder list).
   const client = new EwsClient(ewsUrl, username, password);
   const folders = await client.listCalendarFolders();
+  // Needed so Thunderbird's own invitation UI (Accept/Tentative/Decline)
+  // can recognize "this event invites me" — see registerCalendar() below
+  // and calendar/provider.js's organizerId usage. Best-effort: null just
+  // means that UI won't activate, not a connection failure.
+  const ownerEmail = await client.resolveOwnEmail(username);
 
   const accounts = await getAccounts();
-  accounts[accountId] = { url: ewsUrl, username, displayName: username, needsReauth: false };
+  accounts[accountId] = { url: ewsUrl, username, displayName: username, ownerEmail, needsReauth: false };
   await saveAccounts(accounts);
   await browser.exchangeCalendar.saveCredentials(accountId, username, password);
 
@@ -145,7 +150,11 @@ async function addCalendarInternal(accountId, folderRef, folderName) {
   await saveCalendars(calendars);
 
   const accounts = await getAccounts();
-  await browser.exchangeCalendar.registerCalendar(calendarKey, `${accounts[accountId].displayName} — ${folderName}`);
+  await browser.exchangeCalendar.registerCalendar(
+    calendarKey,
+    `${accounts[accountId].displayName} — ${folderName}`,
+    accounts[accountId].ownerEmail
+  );
   await syncCalendar(calendarKey); // isInitialSync inside suppresses notifications for this first pass
   return calendarKey;
 }
@@ -327,6 +336,13 @@ async function restoreOnStartup() {
     } else {
       passwordCache.set(accountId, credentials.password);
       registerAuthHandler(accountId, account.url, account.username);
+      // Self-heals accounts connected before ownerEmail existed, so
+      // existing users get the Accept/Tentative/Decline UI without
+      // having to disconnect and reconnect.
+      if (!account.ownerEmail) {
+        const client = new EwsClient(account.url, account.username, credentials.password);
+        account.ownerEmail = await client.resolveOwnEmail(account.username);
+      }
     }
   }
   await saveAccounts(accounts);
@@ -336,7 +352,8 @@ async function restoreOnStartup() {
     const account = accounts[calendar.accountId];
     const { wasStoreReset } = await browser.exchangeCalendar.registerCalendar(
       calendarKey,
-      `${account?.displayName ?? calendar.accountId} — ${calendar.folderName}`
+      `${account?.displayName ?? calendar.accountId} — ${calendar.folderName}`,
+      account?.ownerEmail
     );
     if (wasStoreReset) {
       // The on-disk calendar store was just (re)created — e.g. upgrading

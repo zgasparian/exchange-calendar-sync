@@ -43,6 +43,14 @@ Graph has no on-premises equivalent, so this rewrite talks EWS instead.
 - **Accept / Tentative / Decline** actually works: responding to an
   invitation from Thunderbird's own invitation UI sends a real meeting
   response to the organizer via EWS, not just a local-only status change.
+  This needs Thunderbird to recognize an event as "invites me" in the
+  first place, which needs your own email address — resolved
+  automatically via EWS `ResolveNames` when you connect (or directly, if
+  you log in with `user@company.com` rather than `DOMAIN\user`). If that
+  resolution fails or is ambiguous for your AD setup, this one feature
+  silently doesn't activate (events still sync fine either way) — check
+  the add-on's Inspect console for a `could not resolve own email` message
+  if the Accept/Tentative/Decline buttons aren't showing up on an invite.
 - **Outlook categories** sync in both directions (`item:Categories`).
 - **Free/busy**: an event's Exchange free/busy status maps to the
   iCalendar `TRANSP` property. Thunderbird doesn't have Outlook's 4-state
