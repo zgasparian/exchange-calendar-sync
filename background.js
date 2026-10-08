@@ -281,8 +281,44 @@ async function setSyncIntervalMinutes(minutes) {
   return clamped;
 }
 
+/**
+ * Upgrading from a pre-0.4.0 version: `accounts[accountId]` used to carry
+ * its own syncState/lastSyncedAt directly (one account == one, always-
+ * primary, calendar) — there was no separate `calendars` store at all.
+ * Synthesizes the missing `calendars[calendarKey]` entry for any account
+ * that predates that split, reusing its old sync token so this resumes
+ * with a normal incremental sync rather than a full resync. Pairs with
+ * the matching adoption fix in provider.js's `id` setter, which re-keys
+ * that account's existing (already-populated) Thunderbird calendar under
+ * the same calendarKey instead of us ending up with a duplicate.
+ */
+async function migrateLegacyAccounts() {
+  const accounts = await getAccounts();
+  const calendars = await getCalendars();
+  let changed = false;
+  for (const [accountId, account] of Object.entries(accounts)) {
+    if (Object.values(calendars).some(c => c.accountId === accountId)) {
+      continue;
+    }
+    const calendarKey = calendarKeyFor(accountId, PRIMARY_CALENDAR);
+    calendars[calendarKey] = {
+      accountId,
+      folderRef: PRIMARY_CALENDAR,
+      folderName: "Calendar",
+      syncState: account.syncState || null,
+      lastSyncedAt: account.lastSyncedAt || null,
+      needsReauth: false,
+    };
+    changed = true;
+  }
+  if (changed) {
+    await saveCalendars(calendars);
+  }
+}
+
 /** On startup: re-fetch each account's password from the encrypted store into memory, re-arm its auth handler, and make sure every known calendar is registered. */
 async function restoreOnStartup() {
+  await migrateLegacyAccounts();
   const accounts = await getAccounts();
   for (const [accountId, account] of Object.entries(accounts)) {
     const credentials = await browser.exchangeCalendar.getCredentials(accountId);

@@ -103,6 +103,21 @@ upgrading from that version, the first startup on the fixed version
 detects the mismatch and forces one full resync automatically; no action
 needed.)
 
+### Upgrading from a pre-0.4.0 version
+
+0.4.0 introduced the account/calendar split described above (one account,
+multiple possible calendars) — before that, `accounts[accountId]` carried
+its own sync state directly, since it was always exactly one calendar.
+Upgrading in place handles this automatically: `background.js`'s
+`migrateLegacyAccounts()` synthesizes the missing `calendars[calendarKey]`
+entry for any such account (reusing its old sync token so this resumes
+with a normal incremental sync, not a wasteful full one), and
+`provider.js`'s `id` setter re-keys that account's *existing* Thunderbird
+calendar under the new `calendarKey` instead of leaving it orphaned or
+creating a duplicate alongside it. No action needed — but if you updated
+from 0.4.0 itself (not earlier) and noticed new events silently stopped
+syncing while old ones remained, that's exactly this bug; 0.4.1 fixes it.
+
 ## 1. Confirm EWS is reachable (IT-side check)
 
 Ask whoever administers the Exchange server:

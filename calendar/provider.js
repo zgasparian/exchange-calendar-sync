@@ -242,7 +242,22 @@
     }
     set id(value) {
       super.id = value;
-      const calendarKey = this.getProperty("exchangeCalendarKey");
+      let calendarKey = this.getProperty("exchangeCalendarKey");
+      if (!calendarKey) {
+        // Upgrading from a pre-0.4.0 version, which only ever set
+        // exchangeAccountId (back when one account == exactly one,
+        // always-primary, calendar). Adopt this existing calendar under
+        // the new calendarKey scheme — matching calendarKeyFor(accountId,
+        // PRIMARY_CALENDAR) in background.js — instead of leaving it
+        // orphaned (registerCalendar() would otherwise have no way to
+        // find it, so it'd silently stop receiving syncs) or creating a
+        // second, duplicate Thunderbird calendar alongside it.
+        const legacyAccountId = this.getProperty("exchangeAccountId");
+        if (legacyAccountId) {
+          calendarKey = `${legacyAccountId}::calendar`;
+          this.setProperty("exchangeCalendarKey", calendarKey);
+        }
+      }
       if (calendarKey) {
         calendarsByKey.set(calendarKey, this);
       }
