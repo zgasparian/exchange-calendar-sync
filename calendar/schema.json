@@ -6,12 +6,11 @@
       {
         "name": "registerCalendar",
         "type": "function",
-        "description": "Creates (if needed) and registers the Thunderbird calendar for this calendarKey, or updates its display name if it already exists. ownerEmail, if known, lets Thunderbird's own invitation UI (Accept/Tentative/Decline) recognize which attendee is the logged-in user.",
+        "description": "Creates (if needed) and registers the Thunderbird calendar for this calendarKey, or updates its display name if it already exists.",
         "async": true,
         "parameters": [
           { "name": "calendarKey", "type": "string" },
-          { "name": "displayName", "type": "string" },
-          { "name": "ownerEmail", "type": "string", "optional": true }
+          { "name": "displayName", "type": "string" }
         ]
       },
       {

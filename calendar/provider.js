@@ -242,22 +242,7 @@
     }
     set id(value) {
       super.id = value;
-      let calendarKey = this.getProperty("exchangeCalendarKey");
-      if (!calendarKey) {
-        // Upgrading from a pre-0.4.0 version, which only ever set
-        // exchangeAccountId (back when one account == exactly one,
-        // always-primary, calendar). Adopt this existing calendar under
-        // the new calendarKey scheme — matching calendarKeyFor(accountId,
-        // PRIMARY_CALENDAR) in background.js — instead of leaving it
-        // orphaned (registerCalendar() would otherwise have no way to
-        // find it, so it'd silently stop receiving syncs) or creating a
-        // second, duplicate Thunderbird calendar alongside it.
-        const legacyAccountId = this.getProperty("exchangeAccountId");
-        if (legacyAccountId) {
-          calendarKey = `${legacyAccountId}::calendar`;
-          this.setProperty("exchangeCalendarKey", calendarKey);
-        }
-      }
+      const calendarKey = this.getProperty("exchangeCalendarKey");
       if (calendarKey) {
         calendarsByKey.set(calendarKey, this);
       }
@@ -437,40 +422,15 @@
     getAPI(context) {
       return {
         exchangeCalendar: {
-          async registerCalendar(calendarKey, displayName, ownerEmail) {
-            // Forces Thunderbird to (re)create every calendar it has
-            // persisted from a previous session — including ones we
-            // haven't seen yet *this* run — before we decide whether
-            // calendarKey already exists. Without this, a legacy calendar
-            // Thunderbird hadn't gotten around to recreating yet (its own
-            // startup timing, independent of this WebExtension's) would
-            // look "not found" below, and we'd create a second, empty
-            // calendar instead of the `id` setter adopting the real one.
-            cal.manager.getCalendars();
-
+          async registerCalendar(calendarKey, displayName) {
             let calendar = calendarsByKey.get(calendarKey);
             if (calendar) {
               calendar.name = displayName;
-              if (ownerEmail) {
-                calendar.setProperty("organizerId", `mailto:${ownerEmail}`);
-              }
               return { calendarId: calendar.id, wasStoreReset: !!calendar.wasStoreReset };
             }
             calendar = new ExchangeEwsCalendar();
             calendar.setProperty("exchangeCalendarKey", calendarKey);
             calendar.name = displayName;
-            if (ownerEmail) {
-              // Lets cal.provider.BaseClass's isInvitation()/
-              // getInvitedAttendee() (calISchedulingSupport, inherited
-              // from BaseClass — see their fallback paths in
-              // calProviderUtils.sys.mjs) recognize which attendee on an
-              // event is the logged-in user, which is what makes
-              // Thunderbird's own Accept/Tentative/Decline invitation UI
-              // activate at all. Without this, every synced event looks
-              // like an ordinary (non-invitation) appointment to
-              // Thunderbird, regardless of its actual attendee list.
-              calendar.setProperty("organizerId", `mailto:${ownerEmail}`);
-            }
             calendar.uri = Services.io.newURI(`exchangeewssync://${encodeURIComponent(calendarKey)}/`);
             cal.manager.registerCalendar(calendar);
             calendarsByKey.set(calendarKey, calendar);

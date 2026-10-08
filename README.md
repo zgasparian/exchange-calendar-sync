@@ -43,14 +43,6 @@ Graph has no on-premises equivalent, so this rewrite talks EWS instead.
 - **Accept / Tentative / Decline** actually works: responding to an
   invitation from Thunderbird's own invitation UI sends a real meeting
   response to the organizer via EWS, not just a local-only status change.
-  This needs Thunderbird to recognize an event as "invites me" in the
-  first place, which needs your own email address — resolved
-  automatically via EWS `ResolveNames` when you connect (or directly, if
-  you log in with `user@company.com` rather than `DOMAIN\user`). If that
-  resolution fails or is ambiguous for your AD setup, this one feature
-  silently doesn't activate (events still sync fine either way) — check
-  the add-on's Inspect console for a `could not resolve own email` message
-  if the Accept/Tentative/Decline buttons aren't showing up on an invite.
 - **Outlook categories** sync in both directions (`item:Categories`).
 - **Free/busy**: an event's Exchange free/busy status maps to the
   iCalendar `TRANSP` property. Thunderbird doesn't have Outlook's 4-state
@@ -110,36 +102,6 @@ restart even though the calendar's own registration survived. If you're
 upgrading from that version, the first startup on the fixed version
 detects the mismatch and forces one full resync automatically; no action
 needed.)
-
-### Upgrading from a pre-0.4.0 version
-
-0.4.0 introduced the account/calendar split described above (one account,
-multiple possible calendars) — before that, `accounts[accountId]` carried
-its own sync state directly, since it was always exactly one calendar.
-Upgrading in place handles this automatically: `background.js`'s
-`migrateLegacyAccounts()` synthesizes the missing `calendars[calendarKey]`
-entry for any such account (reusing its old sync token so this resumes
-with a normal incremental sync, not a wasteful full one), and
-`provider.js`'s `id` setter re-keys that account's *existing* Thunderbird
-calendar under the new `calendarKey` instead of leaving it orphaned or
-creating a duplicate alongside it. No action needed — but if you updated
-from 0.4.0 itself (not earlier) and noticed new events silently stopped
-syncing while old ones remained, that's exactly this bug; 0.4.1 fixes it.
-
-**0.4.1 had its own bug in that same fix**: `registerCalendar()` only
-checked its own in-memory map for an existing calendar, without forcing
-Thunderbird to finish recreating calendars it hadn't gotten to yet this
-session — a timing race, independent of this add-on, between Thunderbird's
-own startup and this WebExtension's. Losing that race meant a second,
-*empty* calendar got created alongside the real one, and depending on
-which one Thunderbird happened to show as active, it could look like
-every event had vanished. 0.4.2 forces `cal.manager.getCalendars()`
-(which synchronously recreates everything Thunderbird has persisted)
-before checking, closing the race. If you hit this on 0.4.1, check your
-Calendar list for a duplicate "Calendar" entry — if there is one, confirm
-which one is actually empty (click into it) and delete that one; your
-real data is in the other one (and, regardless, always safe on the
-Exchange server itself).
 
 ## 1. Confirm EWS is reachable (IT-side check)
 
