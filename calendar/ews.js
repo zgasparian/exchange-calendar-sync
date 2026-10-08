@@ -15,10 +15,21 @@
  * This file never sets that header itself — doing so would make Gecko
  * treat auth as already handled and skip that listener entirely.
  *
+ * Every FieldURI/operation shape here was verified against Microsoft's own
+ * EWS Managed API source (OfficeDev/ews-managed-api on GitHub) by grepping
+ * the real files directly, not from memory — see the comments at each
+ * call site for what was checked. In particular, AcceptItem/DeclineItem/
+ * TentativelyAcceptItem are NOT separate top-level SOAP operations; they're
+ * item types created via the same CreateItem operation used for new
+ * events (confirmed via CreateResponseObjectRequest, which extends
+ * CreateItemRequestBase).
+ *
  * Exposes:
- *   - class EwsClient        SOAP calls: syncFolderItems / createEvent /
- *                             updateEvent / deleteEvent
+ *   - class EwsClient        SOAP calls: listCalendarFolders /
+ *                             syncFolderItems / createEvent / updateEvent /
+ *                             deleteEvent / respondToInvite
  *   - ewsItemToSimple(xmlEl) / simpleToEwsItemXml(simpleEvent)
+ *   - PRIMARY_CALENDAR       the folderRef for the account's default calendar
  */
 
 const SOAP_NS = "http://schemas.xmlsoap.org/soap/envelope/";
@@ -29,6 +40,17 @@ const MSGS_NS = "http://schemas.microsoft.com/exchange/services/2006/messages";
 // accepts an older one — so this is the safe common denominator rather than
 // the newest schema).
 const SERVER_VERSION = "Exchange2013_SP1";
+
+// A folderRef is either { distinguishedId: "calendar" } (the account's
+// primary calendar) or { id: "<EWS folder id>" } (a secondary calendar,
+// discovered via listCalendarFolders()).
+const PRIMARY_CALENDAR = { distinguishedId: "calendar" };
+
+function folderRefXml(folderRef) {
+  return folderRef.distinguishedId
+    ? `<t:DistinguishedFolderId Id="${escapeXmlAttr(folderRef.distinguishedId)}"/>`
+    : `<t:FolderId Id="${escapeXmlAttr(folderRef.id)}"/>`;
+}
 
 class EwsSoapFault extends Error {
   constructor(message, responseCode) {
@@ -124,13 +146,54 @@ class EwsClient {
   }
 
   /**
-   * Incrementally syncs the primary calendar folder. Pass the syncState
-   * saved from a previous call to get only what changed since; omit it for
-   * an initial full sync. Call repeatedly while `moreAvailable` is true.
+   * Lists calendars available on this account: the primary calendar plus
+   * any secondary ones (e.g. "Team Events") created as child folders of
+   * it — which is where Outlook puts them when you use "Add Calendar" ->
+   * "New Blank Calendar". Does NOT find calendars shared/delegated from a
+   * different mailbox; that's a separate, unimplemented feature.
+   *
+   * FindFolder/FolderShape/DisplayName/FolderClass FieldURIs verified
+   * against FindFolderRequest.cs, FindRequest.cs, FolderView.cs, and
+   * FolderSchema.cs in OfficeDev/ews-managed-api.
+   *
+   * @returns {{folderRef: object, name: string}[]}
+   */
+  async listCalendarFolders() {
+    const body =
+      `<m:FindFolder Traversal="Shallow">` +
+      `<m:FolderShape><t:BaseShape>IdOnly</t:BaseShape>` +
+      `<t:AdditionalProperties>` +
+      `<t:FieldURI FieldURI="folder:DisplayName"/>` +
+      `<t:FieldURI FieldURI="folder:FolderClass"/>` +
+      `</t:AdditionalProperties></m:FolderShape>` +
+      `<m:ParentFolderIds>${folderRefXml(PRIMARY_CALENDAR)}</m:ParentFolderIds>` +
+      `</m:FindFolder>`;
+    const doc = await this.soapRequest(body);
+    this.assertSuccess(doc, "FindFolder");
+
+    const folders = [{ folderRef: PRIMARY_CALENDAR, name: "Calendar" }];
+    for (const folderEl of doc.getElementsByTagNameNS(TYPES_NS, "CalendarFolder")) {
+      const folderClass = text(folderEl, "FolderClass");
+      if (folderClass && folderClass !== "IPF.Appointment") {
+        continue;
+      }
+      const folderId = folderEl.getElementsByTagNameNS(TYPES_NS, "FolderId")[0];
+      const name = text(folderEl, "DisplayName");
+      if (folderId && name) {
+        folders.push({ folderRef: { id: folderId.getAttribute("Id") }, name });
+      }
+    }
+    return folders;
+  }
+
+  /**
+   * Incrementally syncs a calendar folder. Pass the syncState saved from a
+   * previous call to get only what changed since; omit it for an initial
+   * full sync. Call repeatedly while `moreAvailable` is true.
    *
    * @returns {{changes: object[], syncState: string, moreAvailable: boolean}}
    */
-  async syncFolderItems(syncState) {
+  async syncFolderItems(folderRef, syncState) {
     const body =
       `<m:SyncFolderItems>` +
       `<m:ItemShape><t:BaseShape>Default</t:BaseShape>` +
@@ -142,12 +205,17 @@ class EwsClient {
       `<t:FieldURI FieldURI="calendar:IsCancelled"/>` +
       `<t:FieldURI FieldURI="item:ReminderMinutesBeforeStart"/>` +
       `<t:FieldURI FieldURI="item:ReminderIsSet"/>` +
+      `<t:FieldURI FieldURI="item:Categories"/>` +
       `<t:FieldURI FieldURI="calendar:Organizer"/>` +
       `<t:FieldURI FieldURI="calendar:RequiredAttendees"/>` +
       `<t:FieldURI FieldURI="calendar:OptionalAttendees"/>` +
       `<t:FieldURI FieldURI="calendar:UID"/>` +
+      `<t:FieldURI FieldURI="calendar:LegacyFreeBusyStatus"/>` +
+      `<t:FieldURI FieldURI="calendar:MyResponseType"/>` +
+      `<t:FieldURI FieldURI="calendar:IsOnlineMeeting"/>` +
+      `<t:FieldURI FieldURI="calendar:JoinOnlineMeetingUrl"/>` +
       `</t:AdditionalProperties></m:ItemShape>` +
-      `<m:SyncFolderId><t:DistinguishedFolderId Id="calendar"/></m:SyncFolderId>` +
+      `<m:SyncFolderId>${folderRefXml(folderRef)}</m:SyncFolderId>` +
       (syncState ? `<m:SyncState>${escapeXml(syncState)}</m:SyncState>` : "") +
       `<m:MaxChangesReturned>200</m:MaxChangesReturned>` +
       `</m:SyncFolderItems>`;
@@ -159,13 +227,13 @@ class EwsClient {
     for (const created of doc.getElementsByTagNameNS(TYPES_NS, "Create")) {
       const item = created.getElementsByTagNameNS(TYPES_NS, "CalendarItem")[0];
       if (item) {
-        changes.push({ op: "upsert", item: ewsItemToSimple(item) });
+        changes.push({ op: "create", item: ewsItemToSimple(item) });
       }
     }
     for (const updated of doc.getElementsByTagNameNS(TYPES_NS, "Update")) {
       const item = updated.getElementsByTagNameNS(TYPES_NS, "CalendarItem")[0];
       if (item) {
-        changes.push({ op: "upsert", item: ewsItemToSimple(item) });
+        changes.push({ op: "update", item: ewsItemToSimple(item) });
       }
     }
     for (const deleted of doc.getElementsByTagNameNS(TYPES_NS, "Delete")) {
@@ -184,10 +252,10 @@ class EwsClient {
     };
   }
 
-  async createEvent(simpleEvent) {
+  async createEvent(folderRef, simpleEvent) {
     const body =
       `<m:CreateItem SendMeetingInvitations="SendToNone">` +
-      `<m:SavedItemFolderId><t:DistinguishedFolderId Id="calendar"/></m:SavedItemFolderId>` +
+      `<m:SavedItemFolderId>${folderRefXml(folderRef)}</m:SavedItemFolderId>` +
       `<m:Items>${simpleToEwsItemXml(simpleEvent)}</m:Items>` +
       `</m:CreateItem>`;
     const doc = await this.soapRequest(body);
@@ -204,6 +272,7 @@ class EwsClient {
       ["calendar:End", `<t:End>${simpleEvent.endISO}</t:End>`],
       ["calendar:Location", `<t:Location>${escapeXml(simpleEvent.location || "")}</t:Location>`],
       ["calendar:IsAllDayEvent", `<t:IsAllDayEvent>${!!simpleEvent.isAllDay}</t:IsAllDayEvent>`],
+      ["item:Categories", categoriesXml(simpleEvent.categories)],
     ];
     const setFields = fields
       .map(
@@ -233,6 +302,37 @@ class EwsClient {
     const doc = await this.soapRequest(body);
     this.assertSuccess(doc, "DeleteItem");
   }
+
+  /**
+   * Accepts, declines, or tentatively accepts a meeting invitation,
+   * sending the response to the organizer and updating this item in our
+   * own calendar to match.
+   *
+   * AcceptItem/DeclineItem/TentativelyAcceptItem are not separate EWS
+   * operations — they're item types submitted through the same CreateItem
+   * operation used to create a new event, which is why this reuses the
+   * CreateItem shape rather than looking like createEvent()'s sibling.
+   * Verified via CreateResponseObjectRequest (extends
+   * CreateItemRequestBase) and ResponseObjectSchema.ReferenceItemId in
+   * ews-managed-api.
+   *
+   * @param {"ACCEPTED"|"DECLINED"|"TENTATIVE"} response
+   */
+  async respondToInvite(simpleEvent, response) {
+    const elementName = { ACCEPTED: "AcceptItem", DECLINED: "DeclineItem", TENTATIVE: "TentativelyAcceptItem" }[
+      response
+    ];
+    const body =
+      `<m:CreateItem MessageDisposition="SendAndSaveCopy">` +
+      `<m:Items><t:${elementName}>` +
+      `<t:ReferenceItemId Id="${escapeXmlAttr(simpleEvent.id)}" ChangeKey="${escapeXmlAttr(simpleEvent.changeKey || "")}"/>` +
+      `</t:${elementName}></m:Items>` +
+      `</m:CreateItem>`;
+    const doc = await this.soapRequest(body);
+    this.assertSuccess(doc, "CreateItem (meeting response)");
+    const item = doc.getElementsByTagNameNS(TYPES_NS, "CalendarItem")[0];
+    return item ? ewsItemToSimple(item) : simpleEvent;
+  }
 }
 
 function text(el, localName) {
@@ -247,6 +347,12 @@ function mailboxToSimple(mailboxEl) {
     name: text(mailboxEl, "Name") || text(mailboxEl, "EmailAddress"),
     email: text(mailboxEl, "EmailAddress"),
   };
+}
+
+/** <t:Categories><t:String>A</t:String><t:String>B</t:String></t:Categories> — the standard EWS ArrayOfStringsType shape. */
+function categoriesXml(categories) {
+  const entries = (categories || []).map(c => `<t:String>${escapeXml(c)}</t:String>`).join("");
+  return `<t:Categories>${entries}</t:Categories>`;
 }
 
 /** Converts a <t:CalendarItem> element from an EWS response into the plain "SimpleEvent" shape shared with provider.js. */
@@ -275,6 +381,11 @@ function ewsItemToSimple(item) {
     }
   }
 
+  const categoriesContainer = item.getElementsByTagNameNS(TYPES_NS, "Categories")[0];
+  const categories = categoriesContainer
+    ? [...categoriesContainer.getElementsByTagNameNS(TYPES_NS, "String")].map(el => el.textContent)
+    : [];
+
   const isReminderOn = text(item, "ReminderIsSet") === "true";
 
   return {
@@ -289,6 +400,11 @@ function ewsItemToSimple(item) {
     isCancelled: text(item, "IsCancelled") === "true",
     organizer: mailboxToSimple(organizerMailbox),
     attendees,
+    categories,
+    freeBusyStatus: text(item, "LegacyFreeBusyStatus"), // "Free" | "Tentative" | "Busy" | "OOF" | "WorkingElsewhere" | "NoData"
+    myResponseType: text(item, "MyResponseType"),
+    isOnlineMeeting: text(item, "IsOnlineMeeting") === "true",
+    onlineMeetingUrl: text(item, "JoinOnlineMeetingUrl"),
     reminderMinutesBeforeStart: isReminderOn ? parseInt(text(item, "ReminderMinutesBeforeStart") || "0", 10) : null,
     // TODO: recurrence — EWS exposes this via <t:Recurrence> (RelativeYearlyRecurrence,
     // AbsoluteMonthlyRecurrence, etc.) plus separate IsRecurring/CalendarItemType
@@ -330,6 +446,7 @@ function simpleToEwsItemXml(simpleEvent) {
     `<t:End>${simpleEvent.endISO}</t:End>` +
     `<t:IsAllDayEvent>${!!simpleEvent.isAllDay}</t:IsAllDayEvent>` +
     reminderXml +
+    (simpleEvent.categories?.length ? categoriesXml(simpleEvent.categories) : "") +
     attendeesXml("RequiredAttendees", "REQ-PARTICIPANT") +
     attendeesXml("OptionalAttendees", "OPT-PARTICIPANT") +
     // NOTE: recurrence isn't round-tripped on push yet — see the TODO on

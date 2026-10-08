@@ -27,21 +27,53 @@ An earlier version of this extension used Microsoft Graph + OAuth2, which
 only works against Exchange **Online** (Microsoft 365). That's gone now —
 Graph has no on-premises equivalent, so this rewrite talks EWS instead.
 
+## Features
+
+- Two-way sync of events (create/edit/delete) between Thunderbird and an
+  on-prem Exchange calendar.
+- **Cancelled meetings** show with a strikethrough (native Thunderbird
+  rendering for `STATUS=CANCELLED`) and a "Cancelled" category, so you can
+  additionally assign that category a color (e.g. red) in Thunderbird's
+  Calendar → Categories preferences if you want it to stand out more.
+- **Reminders** sync in both directions.
+- **Desktop notifications** for new meeting invites and for meetings that
+  get cancelled (suppressed during a calendar's initial full sync, so
+  connecting an account with months of history doesn't fire a notification
+  storm).
+- **Accept / Tentative / Decline** actually works: responding to an
+  invitation from Thunderbird's own invitation UI sends a real meeting
+  response to the organizer via EWS, not just a local-only status change.
+- **Outlook categories** sync in both directions (`item:Categories`).
+- **Free/busy**: an event's Exchange free/busy status maps to the
+  iCalendar `TRANSP` property. Thunderbird doesn't have Outlook's 4-state
+  (Free/Tentative/Busy/OOF) color-coded display, so this mainly matters
+  for anything that queries this calendar's free/busy, not for how the
+  event looks in your own view.
+- **Online meeting links** (Teams, etc.) are appended to the event
+  description when EWS reports one (`calendar:JoinOnlineMeetingUrl`).
+- **Multiple calendars per account** — sync your primary calendar plus any
+  secondary calendars (e.g. "Team Events") created under it. Shared or
+  delegated calendars from a *different* mailbox aren't supported.
+- Configurable sync interval, last-synced timestamps, encrypted credential
+  storage — see below.
+
 ## Architecture
 
 ```
 manifest.json            MV2, declares the exchangeCalendar Experiment API
-background.js             Account storage, sync scheduling, pushes local
-                           Thunderbird edits to the server, answers HTTP
-                           auth challenges (Basic/NTLM/Negotiate)
+background.js             Account/calendar storage, sync scheduling, pushes
+                           local Thunderbird edits (including meeting
+                           responses) to the server, answers HTTP auth
+                           challenges (Basic/NTLM/Negotiate), desktop
+                           notifications
 calendar/ews.js            EWS SOAP client + EWS<->plain-JSON event mapping
                            (unprivileged — fetch() + DOMParser, no XPCOM)
 calendar/schema.json       Experiment API definition (the privileged bridge)
 calendar/provider.js       calICalendar implementation + Thunderbird
                            registration + encrypted credential storage
                            (privileged — the only file using XPCOM/ChromeUtils)
-ui/options.html,options.js Settings page: server URL/username/password,
-                           connect/remove accounts
+ui/options.html,options.js Settings page: connect/remove accounts, discover
+                           and add/remove secondary calendars, sync interval
 icons/                    Toolbar/about:addons icons
 ```
 
@@ -49,13 +81,20 @@ Networking lives entirely in the unprivileged background page
 (`background.js` + `calendar/ews.js`), exactly like a normal WebExtension.
 The privileged Experiment API (`calendar/provider.js`) only ever talks to
 Thunderbird's calendar manager and to `nsILoginManager` — it registers one
-`calICalendar` per connected account (backed internally by Thunderbird's
+`calICalendar` per *synced calendar* (backed internally by Thunderbird's
 built-in "storage" calendar type — the same persistent SQLite-backed store
 every local/offline calendar in the profile uses, so synced events survive
 a Thunderbird restart), applies batches of changes background.js fetched
 from EWS, relays the user's own edits back out via an `onLocalChange` event
-so background.js can push them to the server, and stores/retrieves that
+so background.js can push them to the server, and stores/retrieves an
 account's password encrypted-at-rest.
+
+One EWS login (an "account") can own several synced calendars — its
+primary one plus any secondary folders you add from the settings page.
+Internally, `accountId` identifies the login (and is what credentials are
+keyed by), while `calendarKey` (`${accountId}::${folderId}`) identifies
+one specific synced calendar; `calendar/provider.js`'s module-level doc
+comment spells out exactly which functions key off which.
 
 (An earlier version used Thunderbird's "memory" calendar type instead,
 which is never written to disk — every synced event vanished on every
@@ -108,8 +147,14 @@ calendar list within a few seconds, populated with your primary calendar's
 events. Edits in either direction sync within 5 minutes by default (local
 edits push immediately) via a `browser.alarms` timer in `background.js` —
 the **Sync frequency** section on the settings page lets you change that
-interval, and each connected account's entry shows when it last synced
+interval, and each synced calendar's row shows when it last synced
 successfully.
+
+To sync an additional (secondary) calendar on the same account, click
+**Add calendar…** next to that account — this looks up every calendar
+folder on the mailbox via EWS and lists whichever ones aren't already
+synced. Each synced calendar gets its own entry (and its own "Remove"
+button) in the list below its account.
 
 ### How authentication actually happens
 
@@ -150,10 +195,14 @@ settings, so the permission can't be scoped narrower ahead of time.
   `calendar/ews.js` (`ewsItemToSimple`/`simpleToEwsItemXml`). Recurring
   events on the server currently won't sync correctly; non-recurring
   events are unaffected.
-- **Reminders** sync from the server to Thunderbird but not back (adding a
-  reminder to an event inside Thunderbird doesn't push to EWS yet).
-- **One calendar per account** — your primary/default calendar only. No
-  shared or secondary calendars.
+- **Free/busy has no dedicated UI.** Thunderbird doesn't render Outlook's
+  4-state (Free/Tentative/Busy/OOF) color coding, so the
+  `LegacyFreeBusyStatus` → `TRANSP` mapping is real but mostly invisible
+  day-to-day; see "Features" above.
+- **Shared/delegate calendars aren't supported** — only calendars that live
+  directly on the account you authenticate as (primary + its own secondary
+  folders). A calendar someone else has shared or delegated to you won't
+  show up in "Add calendar…".
 - **Credential storage**: the password is stored via `nsILoginManager`
   (`calendar/provider.js`'s `saveCredentials`/`getCredentials`), the same
   encrypted store Thunderbird uses for IMAP/SMTP passwords — protected by

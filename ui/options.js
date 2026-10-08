@@ -3,7 +3,7 @@ const usernameInput = document.getElementById("username");
 const passwordInput = document.getElementById("password");
 const connectButton = document.getElementById("connect");
 const loginStatus = document.getElementById("loginStatus");
-const accountsList = document.getElementById("accounts");
+const accountsContainer = document.getElementById("accounts");
 const syncIntervalInput = document.getElementById("syncInterval");
 const saveIntervalButton = document.getElementById("saveInterval");
 const intervalStatus = document.getElementById("intervalStatus");
@@ -17,50 +17,145 @@ function formatLastSynced(lastSyncedAt) {
   return lastSyncedAt ? `Last synced: ${new Date(lastSyncedAt).toLocaleString()}` : "Last synced: never";
 }
 
+function renderCalendarRow(calendar) {
+  const row = document.createElement("div");
+  row.className = "calendar-row";
+
+  const meta = document.createElement("div");
+  meta.className = "calendar-meta";
+  const name = document.createElement("span");
+  name.textContent = calendar.folderName;
+  meta.appendChild(name);
+  const synced = document.createElement("span");
+  synced.className = "synced-at";
+  synced.textContent = formatLastSynced(calendar.lastSyncedAt);
+  meta.appendChild(synced);
+  if (calendar.needsReauth) {
+    const warn = document.createElement("span");
+    warn.className = "warn";
+    warn.textContent = "Sign-in failed — fix the account's password below to resume syncing.";
+    meta.appendChild(warn);
+  }
+  row.appendChild(meta);
+
+  const removeButton = document.createElement("button");
+  removeButton.className = "remove small";
+  removeButton.textContent = "Remove";
+  removeButton.addEventListener("click", async () => {
+    removeButton.disabled = true;
+    await browser.runtime.sendMessage({ type: "removeCalendar", calendarKey: calendar.calendarKey });
+    await refreshAccounts();
+  });
+  row.appendChild(removeButton);
+
+  return row;
+}
+
+function renderAccount(account) {
+  const block = document.createElement("div");
+  block.className = "account-block";
+
+  const header = document.createElement("div");
+  header.className = "account-header";
+
+  const meta = document.createElement("div");
+  meta.className = "acct-meta";
+  const name = document.createElement("span");
+  name.textContent = account.username;
+  meta.appendChild(name);
+  const url = document.createElement("span");
+  url.className = "acct-url";
+  url.textContent = account.url;
+  meta.appendChild(url);
+  if (account.needsReauth) {
+    const warn = document.createElement("span");
+    warn.className = "warn";
+    warn.textContent = "Sign-in failed — reconnect above with this account's current password.";
+    meta.appendChild(warn);
+  }
+  header.appendChild(meta);
+
+  const actions = document.createElement("div");
+  const addCalendarButton = document.createElement("button");
+  addCalendarButton.className = "small";
+  addCalendarButton.textContent = "Add calendar…";
+  actions.appendChild(addCalendarButton);
+  const removeAccountButton = document.createElement("button");
+  removeAccountButton.className = "remove small";
+  removeAccountButton.textContent = "Remove account";
+  actions.appendChild(removeAccountButton);
+  header.appendChild(actions);
+
+  block.appendChild(header);
+
+  for (const calendar of account.calendars) {
+    block.appendChild(renderCalendarRow(calendar));
+  }
+
+  const discoveryArea = document.createElement("div");
+  discoveryArea.className = "add-calendar-area";
+  block.appendChild(discoveryArea);
+
+  addCalendarButton.addEventListener("click", async () => {
+    addCalendarButton.disabled = true;
+    discoveryArea.textContent = "Looking up calendars on this account…";
+    const response = await browser.runtime.sendMessage({ type: "listFolders", accountId: account.accountId });
+    addCalendarButton.disabled = false;
+    discoveryArea.textContent = "";
+    if (!response.ok) {
+      discoveryArea.textContent = `Could not list calendars: ${response.error}`;
+      return;
+    }
+    const unsynced = response.folders.filter(f => !f.synced);
+    if (!unsynced.length) {
+      discoveryArea.textContent = "Every calendar on this account is already synced.";
+      return;
+    }
+    for (const folder of unsynced) {
+      const row = document.createElement("div");
+      row.className = "folder-row";
+      const label = document.createElement("span");
+      label.textContent = folder.name;
+      row.appendChild(label);
+      const addButton = document.createElement("button");
+      addButton.className = "small";
+      addButton.textContent = "Add";
+      addButton.addEventListener("click", async () => {
+        addButton.disabled = true;
+        await browser.runtime.sendMessage({
+          type: "addCalendar",
+          accountId: account.accountId,
+          folderRef: folder.folderRef,
+          folderName: folder.name,
+        });
+        await refreshAccounts();
+      });
+      row.appendChild(addButton);
+      discoveryArea.appendChild(row);
+    }
+  });
+
+  removeAccountButton.addEventListener("click", async () => {
+    removeAccountButton.disabled = true;
+    await browser.runtime.sendMessage({ type: "removeAccount", accountId: account.accountId });
+    await refreshAccounts();
+  });
+
+  return block;
+}
+
 async function refreshAccounts() {
   const accounts = await browser.runtime.sendMessage({ type: "listAccounts" });
-  accountsList.innerHTML = "";
+  accountsContainer.innerHTML = "";
   if (!accounts.length) {
-    const li = document.createElement("li");
-    li.textContent = "No accounts connected yet.";
-    accountsList.appendChild(li);
+    const empty = document.createElement("p");
+    empty.className = "hint";
+    empty.textContent = "No accounts connected yet.";
+    accountsContainer.appendChild(empty);
     return;
   }
   for (const account of accounts) {
-    const li = document.createElement("li");
-
-    const meta = document.createElement("div");
-    meta.className = "acct-meta";
-    const name = document.createElement("span");
-    name.textContent = account.username;
-    meta.appendChild(name);
-    const url = document.createElement("span");
-    url.className = "acct-url";
-    url.textContent = account.url;
-    meta.appendChild(url);
-    const synced = document.createElement("span");
-    synced.className = "acct-url";
-    synced.textContent = formatLastSynced(account.lastSyncedAt);
-    meta.appendChild(synced);
-    if (account.needsReauth) {
-      const warn = document.createElement("span");
-      warn.className = "warn";
-      warn.textContent = "Sign-in failed — reconnect below with your current password.";
-      meta.appendChild(warn);
-    }
-    li.appendChild(meta);
-
-    const removeButton = document.createElement("button");
-    removeButton.className = "remove";
-    removeButton.textContent = "Remove";
-    removeButton.addEventListener("click", async () => {
-      removeButton.disabled = true;
-      await browser.runtime.sendMessage({ type: "removeAccount", accountId: account.accountId });
-      await refreshAccounts();
-    });
-    li.appendChild(removeButton);
-
-    accountsList.appendChild(li);
+    accountsContainer.appendChild(renderAccount(account));
   }
 }
 

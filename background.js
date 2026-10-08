@@ -1,22 +1,31 @@
 /*
- * background.js — account management for an on-premises Exchange server.
+ * background.js — account & calendar management for an on-premises
+ * Exchange server.
  *
  * Runs as a normal, unprivileged WebExtension background page (manifest.json
  * loads calendar/ews.js first, into the same global scope, so EwsClient /
- * ewsItemToSimple / simpleToEwsItemXml are already available here as plain
- * globals).
+ * ewsItemToSimple / simpleToEwsItemXml are already available here as
+ * plain globals).
  *
- * Non-secret account metadata (EWS URL, username, display name, sync
- * state) lives in browser.storage.local. The password does not — it's
- * stored encrypted via the privileged `browser.exchangeCalendar.*`
- * credential functions (see calendar/schema.json / calendar/provider.js,
- * backed by nsILoginManager) and only ever held in memory here, per
- * account, for as long as the background page is alive.
+ * Two storage concepts, kept separate because one EWS login can sync
+ * several calendars (its primary one plus any secondary folders):
+ *   - accounts[accountId]      one EWS login: {url, username, displayName,
+ *                               needsReauth}. accountId = username.toLowerCase().
+ *   - calendars[calendarKey]   one synced calendar (folder): {accountId,
+ *                               folderRef, folderName, syncState,
+ *                               lastSyncedAt, needsReauth}.
+ *                               calendarKey = `${accountId}::${folderRef.id
+ *                               || folderRef.distinguishedId}`.
+ *
+ * Passwords live only in `passwordCache` (in memory, this session only) —
+ * persisted copies go through the privileged `browser.exchangeCalendar.*`
+ * credential functions (nsILoginManager), never browser.storage.local.
  *
  * This file never touches XPCOM/Thunderbird internals directly — it only
- * calls `browser.exchangeCalendar.*` to register a calendar and push
- * synced events into it, and listens for `onLocalChange` to push the
- * user's own edits back out to the server.
+ * calls `browser.exchangeCalendar.*` to register calendars and push
+ * synced events into them, and listens for `onLocalChange` to push the
+ * user's own edits (including meeting-response clicks) back out to the
+ * server.
  */
 
 const SYNC_ALARM = "exchangeCalendarSync";
@@ -25,6 +34,10 @@ const SYNC_ALARM = "exchangeCalendarSync";
 // the webRequest.onAuthRequired listener can answer NTLM/Negotiate/Basic
 // challenges without round-tripping through the Experiment API each time.
 const passwordCache = new Map();
+
+function calendarKeyFor(accountId, folderRef) {
+  return `${accountId}::${folderRef.id || folderRef.distinguishedId}`;
+}
 
 async function getAccounts() {
   const { accounts } = await browser.storage.local.get("accounts");
@@ -35,14 +48,15 @@ async function saveAccounts(accounts) {
   await browser.storage.local.set({ accounts });
 }
 
-/**
- * EWS is a sibling virtual directory to OWA on the Exchange CAS server
- * (https://mail.company.com/owa and https://mail.company.com/EWS/Exchange.asmx
- * share a host, EWS is never *under* /owa), so whatever path the user
- * pastes — the OWA link IT actually hands out, a bare hostname, or the
- * EWS URL itself — we only keep the scheme+host+port and rebuild the EWS
- * path ourselves rather than appending onto whatever path was given.
- */
+async function getCalendars() {
+  const { calendars } = await browser.storage.local.get("calendars");
+  return calendars || {};
+}
+
+async function saveCalendars(calendars) {
+  await browser.storage.local.set({ calendars });
+}
+
 function normalizeEwsUrl(input) {
   const trimmed = input.trim();
   const withScheme = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
@@ -72,34 +86,78 @@ async function connectAccount(url, username, password) {
   passwordCache.set(accountId, password);
   registerAuthHandler(accountId, ewsUrl, username);
 
-  // This first sync page both proves the URL/credentials work and is the
-  // start of the real initial sync — no separate throwaway "test" call.
+  // Also proves the URL/credentials work, same as the old throwaway test
+  // call used to, but this result is actually useful (the folder list).
   const client = new EwsClient(ewsUrl, username, password);
-  const firstPage = await client.syncFolderItems(null);
+  const folders = await client.listCalendarFolders();
 
   const accounts = await getAccounts();
-  accounts[accountId] = {
-    url: ewsUrl,
-    username,
-    displayName: username,
-    syncState: firstPage.syncState,
-    needsReauth: false,
-    lastSyncedAt: null,
-  };
+  accounts[accountId] = { url: ewsUrl, username, displayName: username, needsReauth: false };
   await saveAccounts(accounts);
   await browser.exchangeCalendar.saveCredentials(accountId, username, password);
-  await browser.exchangeCalendar.registerCalendar(accountId, accounts[accountId].displayName);
+
+  // Primary calendar auto-syncs immediately, matching prior versions'
+  // behavior; secondary calendars (if any) are opt-in via addCalendar().
+  const primary = folders.find(f => f.folderRef.distinguishedId) || folders[0];
+  await addCalendarInternal(accountId, primary.folderRef, primary.name);
   await ensureSyncAlarm();
 
-  if (firstPage.changes.length) {
-    await browser.exchangeCalendar.applyRemoteChanges(accountId, firstPage.changes);
+  return {
+    account: { accountId, username, url: ewsUrl },
+    folders: await annotateFolders(accountId, folders),
+  };
+}
+
+/** Cross-references EWS's folder list against what's already synced, for the settings page. */
+async function annotateFolders(accountId, folders) {
+  const calendars = await getCalendars();
+  const syncedKeys = new Set(Object.keys(calendars).filter(k => calendars[k].accountId === accountId));
+  return folders.map(f => ({
+    folderRef: f.folderRef,
+    name: f.name,
+    calendarKey: calendarKeyFor(accountId, f.folderRef),
+    synced: syncedKeys.has(calendarKeyFor(accountId, f.folderRef)),
+  }));
+}
+
+async function listFolders(accountId) {
+  const accounts = await getAccounts();
+  const account = accounts[accountId];
+  if (!account) {
+    throw new Error(`Unknown account ${accountId}`);
   }
-  accounts[accountId].lastSyncedAt = Date.now();
-  await saveAccounts(accounts);
-  if (firstPage.moreAvailable) {
-    await syncAccount(accountId); // pages through the rest, and bumps lastSyncedAt again when done
+  const client = new EwsClient(account.url, account.username, passwordCache.get(accountId));
+  const folders = await client.listCalendarFolders();
+  return annotateFolders(accountId, folders);
+}
+
+async function addCalendarInternal(accountId, folderRef, folderName) {
+  const calendarKey = calendarKeyFor(accountId, folderRef);
+  const calendars = await getCalendars();
+  calendars[calendarKey] = {
+    accountId,
+    folderRef,
+    folderName,
+    syncState: null,
+    lastSyncedAt: null,
+    needsReauth: false,
+  };
+  await saveCalendars(calendars);
+
+  const accounts = await getAccounts();
+  await browser.exchangeCalendar.registerCalendar(calendarKey, `${accounts[accountId].displayName} — ${folderName}`);
+  await syncCalendar(calendarKey); // isInitialSync inside suppresses notifications for this first pass
+  return calendarKey;
+}
+
+async function removeCalendar(calendarKey) {
+  const calendars = await getCalendars();
+  if (!calendars[calendarKey]) {
+    return;
   }
-  return accounts[accountId];
+  await browser.exchangeCalendar.unregisterCalendar(calendarKey);
+  delete calendars[calendarKey];
+  await saveCalendars(calendars);
 }
 
 async function removeAccount(accountId) {
@@ -107,68 +165,98 @@ async function removeAccount(accountId) {
   if (!accounts[accountId]) {
     return;
   }
-  await browser.exchangeCalendar.unregisterCalendar(accountId);
+  const calendars = await getCalendars();
+  for (const calendarKey of Object.keys(calendars)) {
+    if (calendars[calendarKey].accountId === accountId) {
+      await removeCalendar(calendarKey);
+    }
+  }
+  await browser.exchangeCalendar.deleteCredentials(accountId);
   passwordCache.delete(accountId);
   delete accounts[accountId];
   await saveAccounts(accounts);
 }
 
-async function syncAccount(accountId) {
+async function syncCalendar(calendarKey) {
+  const calendars = await getCalendars();
+  const calendar = calendars[calendarKey];
+  if (!calendar) {
+    return;
+  }
   const accounts = await getAccounts();
-  const account = accounts[accountId];
-  const password = passwordCache.get(accountId);
+  const account = accounts[calendar.accountId];
+  const password = passwordCache.get(calendar.accountId);
   if (!account || !password) {
     return;
   }
   const client = new EwsClient(account.url, account.username, password);
+  // Suppresses notifications on a calendar's very first sync — otherwise
+  // connecting an account with months of history would fire a desktop
+  // notification for every single existing meeting.
+  const isInitialSync = !calendar.syncState;
   try {
-    let syncState = account.syncState;
+    let syncState = calendar.syncState;
     let moreAvailable = true;
     while (moreAvailable) {
-      const result = await client.syncFolderItems(syncState);
+      const result = await client.syncFolderItems(calendar.folderRef, syncState);
       if (result.changes.length) {
-        await browser.exchangeCalendar.applyRemoteChanges(accountId, result.changes);
+        await browser.exchangeCalendar.applyRemoteChanges(calendarKey, result.changes);
+        if (!isInitialSync) {
+          notifyForChanges(calendar, result.changes);
+        }
       }
       syncState = result.syncState;
       moreAvailable = result.moreAvailable;
     }
-    account.syncState = syncState;
-    account.needsReauth = false;
-    account.lastSyncedAt = Date.now();
-    await saveAccounts(accounts);
+    calendar.syncState = syncState;
+    calendar.needsReauth = false;
+    calendar.lastSyncedAt = Date.now();
+    await saveCalendars(calendars);
   } catch (e) {
     if (isAuthError(e)) {
-      account.needsReauth = true;
-      await saveAccounts(accounts);
+      calendar.needsReauth = true;
+      await saveCalendars(calendars);
       notifyReauthRequired(account);
       return;
     }
-    console.error(`exchangeCalendar: sync failed for ${accountId}`, e);
+    console.error(`exchangeCalendar: sync failed for ${calendarKey}`, e);
   }
 }
 
+function notifyForChanges(calendar, changes) {
+  for (const change of changes) {
+    if (change.op === "delete") {
+      continue;
+    }
+    if (change.item.isCancelled) {
+      notify(`Meeting cancelled — ${calendar.folderName}`, change.item.title || "(no title)");
+    } else if (change.op === "create") {
+      notify(`New meeting invite — ${calendar.folderName}`, change.item.title || "(no title)");
+    }
+  }
+}
+
+function notify(title, message) {
+  browser.notifications
+    .create({ type: "basic", iconUrl: "icons/icon-48.png", title, message })
+    .catch(() => {});
+}
+
 function isAuthError(e) {
-  return /\b401\b/.test(e.message || "") || e.name === "EwsSoapFault" && e.responseCode === "ErrorAccessDenied";
+  return /\b401\b/.test(e.message || "") || (e.name === "EwsSoapFault" && e.responseCode === "ErrorAccessDenied");
 }
 
 async function syncAll() {
-  const accounts = await getAccounts();
-  for (const accountId of Object.keys(accounts)) {
-    if (!accounts[accountId].needsReauth) {
-      await syncAccount(accountId);
+  const calendars = await getCalendars();
+  for (const calendarKey of Object.keys(calendars)) {
+    if (!calendars[calendarKey].needsReauth) {
+      await syncCalendar(calendarKey);
     }
   }
 }
 
 function notifyReauthRequired(account) {
-  browser.notifications
-    .create({
-      type: "basic",
-      iconUrl: "icons/icon-48.png",
-      title: "Exchange Calendar Sync",
-      message: `Sign-in failed for ${account.username}. Open the add-on's settings to re-enter your password.`,
-    })
-    .catch(() => {});
+  notify("Exchange Calendar Sync", `Sign-in failed for ${account.username}. Open the add-on's settings to re-enter your password.`);
 }
 
 const DEFAULT_SYNC_INTERVAL_MINUTES = 5;
@@ -193,8 +281,8 @@ async function setSyncIntervalMinutes(minutes) {
   return clamped;
 }
 
-/** On startup: re-fetch each account's password from the encrypted store into memory, re-arm its auth handler, and make sure its calendar is registered. */
-async function restoreAccountsOnStartup() {
+/** On startup: re-fetch each account's password from the encrypted store into memory, re-arm its auth handler, and make sure every known calendar is registered. */
+async function restoreOnStartup() {
   const accounts = await getAccounts();
   for (const [accountId, account] of Object.entries(accounts)) {
     const credentials = await browser.exchangeCalendar.getCredentials(accountId);
@@ -204,18 +292,42 @@ async function restoreAccountsOnStartup() {
       passwordCache.set(accountId, credentials.password);
       registerAuthHandler(accountId, account.url, account.username);
     }
-    const { wasStoreReset } = await browser.exchangeCalendar.registerCalendar(accountId, account.displayName);
+  }
+  await saveAccounts(accounts);
+
+  const calendars = await getCalendars();
+  for (const [calendarKey, calendar] of Object.entries(calendars)) {
+    const account = accounts[calendar.accountId];
+    const { wasStoreReset } = await browser.exchangeCalendar.registerCalendar(
+      calendarKey,
+      `${account?.displayName ?? calendar.accountId} — ${calendar.folderName}`
+    );
     if (wasStoreReset) {
       // The on-disk calendar store was just (re)created — e.g. upgrading
-      // from a version that used the non-persistent "memory" backing — so
+      // from a version that used the non-persistent "memory" backing, or
+      // from before calendars were tracked separately from accounts — so
       // our saved delta-sync token no longer corresponds to anything on
       // disk. A normal incremental sync from it would correctly see "no
       // server-side changes" and leave the calendar empty forever; force
       // a full resync instead.
-      account.syncState = null;
+      calendar.syncState = null;
     }
   }
-  await saveAccounts(accounts);
+  await saveCalendars(calendars);
+}
+
+/** Finds which attendee's own RSVP changed between two SimpleEvent snapshots of the same item, if any. */
+function detectRsvpChange(item, oldItem) {
+  if (!oldItem) {
+    return null;
+  }
+  for (const newAttendee of item.attendees || []) {
+    const oldAttendee = (oldItem.attendees || []).find(a => a.email === newAttendee.email);
+    if (oldAttendee && oldAttendee.status !== newAttendee.status) {
+      return newAttendee.status;
+    }
+  }
+  return null;
 }
 
 browser.alarms.onAlarm.addListener(alarm => {
@@ -224,14 +336,20 @@ browser.alarms.onAlarm.addListener(alarm => {
   }
 });
 
-// The user edited/added/deleted an event directly in Thunderbird; push it to the EWS server.
-browser.exchangeCalendar.onLocalChange.addListener(async (accountId, op, item, oldItem, requestId) => {
+// The user edited/added/deleted an event (or clicked Accept/Decline/
+// Tentative on an invite) directly in Thunderbird; push it to the server.
+browser.exchangeCalendar.onLocalChange.addListener(async (calendarKey, op, item, oldItem, requestId) => {
   try {
+    const calendars = await getCalendars();
+    const calendar = calendars[calendarKey];
+    if (!calendar) {
+      throw new Error(`Unknown calendar ${calendarKey}`);
+    }
     const accounts = await getAccounts();
-    const account = accounts[accountId];
-    const password = passwordCache.get(accountId);
+    const account = accounts[calendar.accountId];
+    const password = passwordCache.get(calendar.accountId);
     if (!account || !password) {
-      throw new Error(`Unknown or signed-out account ${accountId}`);
+      throw new Error(`Unknown or signed-out account ${calendar.accountId}`);
     }
     const client = new EwsClient(account.url, account.username, password);
 
@@ -239,9 +357,14 @@ browser.exchangeCalendar.onLocalChange.addListener(async (accountId, op, item, o
     if (op === "delete") {
       await client.deleteEvent(item);
     } else if (op === "add") {
-      result = await client.createEvent(item);
+      result = await client.createEvent(calendar.folderRef, item);
     } else {
-      result = await client.updateEvent(item);
+      const rsvpStatus = detectRsvpChange(item, oldItem);
+      if (rsvpStatus && ["ACCEPTED", "DECLINED", "TENTATIVE"].includes(rsvpStatus)) {
+        result = await client.respondToInvite(item, rsvpStatus);
+      } else {
+        result = await client.updateEvent(item);
+      }
     }
     await browser.exchangeCalendar.resolveLocalChange(requestId, result);
   } catch (e) {
@@ -256,19 +379,26 @@ browser.runtime.onMessage.addListener(async message => {
   switch (message.type) {
     case "listAccounts": {
       const accounts = await getAccounts();
+      const calendars = await getCalendars();
       return Object.entries(accounts).map(([accountId, a]) => ({
         accountId,
-        displayName: a.displayName,
         username: a.username,
         url: a.url,
         needsReauth: a.needsReauth,
-        lastSyncedAt: a.lastSyncedAt || null,
+        calendars: Object.entries(calendars)
+          .filter(([, c]) => c.accountId === accountId)
+          .map(([calendarKey, c]) => ({
+            calendarKey,
+            folderName: c.folderName,
+            lastSyncedAt: c.lastSyncedAt,
+            needsReauth: c.needsReauth,
+          })),
       }));
     }
     case "connectAccount": {
       try {
-        const account = await connectAccount(message.url, message.username, message.password);
-        return { ok: true, account };
+        const result = await connectAccount(message.url, message.username, message.password);
+        return { ok: true, ...result };
       } catch (e) {
         console.error("exchangeCalendar: connect failed", e);
         return { ok: false, error: e.message || String(e) };
@@ -277,8 +407,26 @@ browser.runtime.onMessage.addListener(async message => {
     case "removeAccount":
       await removeAccount(message.accountId);
       return { ok: true };
+    case "listFolders": {
+      try {
+        return { ok: true, folders: await listFolders(message.accountId) };
+      } catch (e) {
+        return { ok: false, error: e.message || String(e) };
+      }
+    }
+    case "addCalendar": {
+      try {
+        const calendarKey = await addCalendarInternal(message.accountId, message.folderRef, message.folderName);
+        return { ok: true, calendarKey };
+      } catch (e) {
+        return { ok: false, error: e.message || String(e) };
+      }
+    }
+    case "removeCalendar":
+      await removeCalendar(message.calendarKey);
+      return { ok: true };
     case "syncNow":
-      await syncAccount(message.accountId);
+      await syncCalendar(message.calendarKey);
       return { ok: true };
     case "getSyncIntervalMinutes":
       return { minutes: await getSyncIntervalMinutes() };
@@ -289,4 +437,4 @@ browser.runtime.onMessage.addListener(async message => {
   }
 });
 
-restoreAccountsOnStartup().then(ensureSyncAlarm).then(syncAll);
+restoreOnStartup().then(ensureSyncAlarm).then(syncAll);

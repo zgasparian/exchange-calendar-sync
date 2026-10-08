@@ -1,25 +1,25 @@
 [
   {
     "namespace": "exchangeCalendar",
-    "description": "Bridges the unprivileged background page to Thunderbird's calendar manager and credential store. All EWS networking happens in background.js + calendar/ews.js; this API only ever touches calICalendar and nsILoginManager.",
+    "description": "Bridges the unprivileged background page to Thunderbird's calendar manager and credential store. All EWS networking happens in background.js + calendar/ews.js; this API only ever touches calICalendar and nsILoginManager. 'calendarKey' identifies one synced calendar (folder); 'accountId' identifies one EWS login, which may own several synced calendars.",
     "functions": [
       {
         "name": "registerCalendar",
         "type": "function",
-        "description": "Creates (if needed) and registers the Thunderbird calendar for this account, or updates its display name if it already exists.",
+        "description": "Creates (if needed) and registers the Thunderbird calendar for this calendarKey, or updates its display name if it already exists.",
         "async": true,
         "parameters": [
-          { "name": "accountId", "type": "string" },
+          { "name": "calendarKey", "type": "string" },
           { "name": "displayName", "type": "string" }
         ]
       },
       {
         "name": "unregisterCalendar",
         "type": "function",
-        "description": "Removes the Thunderbird calendar associated with this account and clears its stored credentials.",
+        "description": "Removes the Thunderbird calendar for this calendarKey. Does not touch any account's stored credentials.",
         "async": true,
         "parameters": [
-          { "name": "accountId", "type": "string" }
+          { "name": "calendarKey", "type": "string" }
         ]
       },
       {
@@ -28,7 +28,7 @@
         "description": "Applies a batch of changes fetched from the EWS server (add/modify/delete) to the local calendar cache, notifying Thunderbird's UI.",
         "async": true,
         "parameters": [
-          { "name": "accountId", "type": "string" },
+          { "name": "calendarKey", "type": "string" },
           {
             "name": "changes",
             "type": "array",
@@ -92,7 +92,7 @@
         "type": "function",
         "description": "Fired when the Thunderbird user adds, edits, or deletes an event directly in the calendar UI, so background.js can push it to the EWS server.",
         "parameters": [
-          { "name": "accountId", "type": "string" },
+          { "name": "calendarKey", "type": "string" },
           { "name": "op", "type": "string", "enum": ["add", "modify", "delete"] },
           { "name": "item", "type": "any" },
           { "name": "oldItem", "type": "any", "optional": true },

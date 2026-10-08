@@ -10,28 +10,39 @@
  * only ever talks to Thunderbird's calendar manager, plus nsILoginManager
  * for credential storage:
  *
- *   - registers a calICalendar type ("exchangeEwsSync") and, per account,
- *     one calICalendar instance backed by an internal "memory" calendar
- *     (the same delegation trick Thunderbird's own in-progress native
- *     GraphCalendar.sys.mjs prototype uses for storage);
+ *   - registers a calICalendar type ("exchangeEwsSync") and, per *synced
+ *     calendar* (one EWS login/account may sync several folders — see
+ *     "calendarKey" below), one calICalendar instance backed by an
+ *     internal "storage" (SQLite) calendar for persistence;
  *   - applyRemoteChanges() lets background.js push what it fetched from
  *     EWS into that store, which fires the normal onAddItem/onModifyItem/
  *     onDeleteItem notifications so open calendar views update live;
  *   - when the *user* adds/edits/deletes an event in Thunderbird's own UI,
  *     this fires onLocalChange out to background.js, which pushes it to
  *     the server and calls back resolveLocalChange()/rejectLocalChange();
- *   - saveCredentials()/getCredentials()/deleteCredentials() store the
- *     EWS username+password in nsILoginManager (the same encrypted store
- *     IMAP/SMTP passwords use), since background.js is unprivileged and
- *     can't reach it directly.
+ *   - saveCredentials()/getCredentials()/deleteCredentials() store an EWS
+ *     login's username+password in nsILoginManager (the same encrypted
+ *     store IMAP/SMTP passwords use), since background.js is unprivileged
+ *     and can't reach it directly.
+ *
+ * Naming note: an "accountId" is one EWS login (url+username+password).
+ * Since one login can sync multiple calendars (primary + secondary
+ * folders), each synced calendar has its own "calendarKey" (background.js
+ * mints these as `${accountId}::${folderId}`) — registerCalendar/
+ * unregisterCalendar/applyRemoteChanges/onLocalChange all key off
+ * calendarKey, while saveCredentials/getCredentials/deleteCredentials key
+ * off accountId, since credentials belong to the login, not to any one
+ * synced calendar.
  *
  * The calICalendar contract used here (promise-based addItem/modifyItem/
  * deleteItem/getItem, cal.provider.BaseClass, cal.manager.register*) was
  * verified against this machine's installed Thunderbird 156 by extracting
  * omni.ja and reading CalCalendarManager.sys.mjs, calProviderUtils.sys.mjs,
  * CalDavCalendar.sys.mjs and the (unfinished, read-only) native
- * GraphCalendar.sys.mjs — not guessed from memory. Still, if a future
- * Thunderbird version changes this contract, this file is where to look.
+ * GraphCalendar.sys.mjs — not guessed from memory. Likewise CalAlarm.sys.mjs
+ * and CalDuration.sys.mjs for the reminder mapping below. Still, if a
+ * future Thunderbird version changes this contract, this file is where to
+ * look.
  */
 
 (function (exports) {
@@ -40,13 +51,22 @@
   const { cal } = ChromeUtils.importESModule("resource:///modules/calendar/calUtils.sys.mjs");
   const { CalEvent } = ChromeUtils.importESModule("resource:///modules/CalEvent.sys.mjs");
   const { CalAttendee } = ChromeUtils.importESModule("resource:///modules/CalAttendee.sys.mjs");
+  const { CalAlarm } = ChromeUtils.importESModule("resource:///modules/CalAlarm.sys.mjs");
+  const { CalDuration } = ChromeUtils.importESModule("resource:///modules/CalDuration.sys.mjs");
   const { CalRecurrenceInfo } = ChromeUtils.importESModule("resource:///modules/CalRecurrenceInfo.sys.mjs");
   const { CalRecurrenceRule } = ChromeUtils.importESModule("resource:///modules/CalRecurrenceRule.sys.mjs");
 
   const CALENDAR_TYPE = "exchangeEwsSync";
+  // Synthetic category tag applied to cancelled meetings so the user can
+  // assign it a color (e.g. red) in Thunderbird's Categories preferences —
+  // Thunderbird has no native per-event color outside of categories.
+  // event.status = "CANCELLED" (set below) already gets a native
+  // strikethrough in calendar views with no configuration needed.
+  const CANCELLED_CATEGORY = "Cancelled";
 
   // Synthetic (never dereferenced) origin used as the nsILoginManager lookup
-  // key for an account's EWS credentials — one entry per accountId.
+  // key for an account's EWS credentials — one entry per accountId. Several
+  // synced calendars (calendarKeys) can share one accountId's credentials.
   function credentialScope(accountId) {
     return { origin: `exchangecalendarsync://${encodeURIComponent(accountId)}`, httpRealm: "ews" };
   }
@@ -58,9 +78,9 @@
     }
   }
 
-  // accountId -> ExchangeEwsCalendar instance (repopulated as calendars
+  // calendarKey -> ExchangeEwsCalendar instance (repopulated as calendars
   // are (re)created, see the `id` setter override below).
-  const calendarsByAccount = new Map();
+  const calendarsByKey = new Map();
 
   // requestId -> {resolve, reject}, for addItem/modifyItem/deleteItem calls
   // that are waiting on background.js to finish talking to the EWS server.
@@ -70,11 +90,37 @@
   // listener registered (effectively always, once the add-on has started).
   let fireLocalChange = null;
 
+  /** calIAlarm for "N minutes before start", the only shape EWS reminders use. */
+  function buildReminderAlarm(minutesBeforeStart) {
+    const alarm = new CalAlarm();
+    alarm.related = Ci.calIAlarm.ALARM_RELATED_START;
+    const duration = new CalDuration();
+    duration.inSeconds = -Math.abs(minutesBeforeStart) * 60;
+    alarm.offset = duration;
+    alarm.action = "DISPLAY";
+    return alarm;
+  }
+
+  /** Reverse of buildReminderAlarm(): reads back the "before start" alarm, if any, in minutes. */
+  function getReminderMinutesBeforeStart(event) {
+    const alarm = event.getAlarms().find(a => a.related === Ci.calIAlarm.ALARM_RELATED_START && a.offset);
+    return alarm ? Math.round(Math.abs(alarm.offset.inSeconds) / 60) : null;
+  }
+
+  function buildDescriptionText(simple) {
+    let description = simple.description || "";
+    if (simple.onlineMeetingUrl && !description.includes(simple.onlineMeetingUrl)) {
+      const line = `Join online meeting: ${simple.onlineMeetingUrl}`;
+      description = description ? `${description}\n\n${line}` : line;
+    }
+    return description;
+  }
+
   function simpleToCalEvent(simple) {
     const event = new CalEvent();
     event.id = simple.id;
     event.title = simple.title || "";
-    event.descriptionText = simple.description || "";
+    event.descriptionText = buildDescriptionText(simple);
     if (simple.location) {
       event.setProperty("LOCATION", simple.location);
     }
@@ -110,6 +156,33 @@
         console.error("exchangeCalendar: could not apply recurrence rule", simple.recurrenceRule, e);
       }
     }
+
+    // Cancelled meetings: STATUS=CANCELLED gets a native strikethrough in
+    // Thunderbird's calendar views with zero configuration. The category
+    // is additionally there so the user can optionally assign it a color
+    // (e.g. red) in Calendar > Categories, since per-event colors in
+    // Thunderbird are driven by categories, not a direct color property.
+    const categories = [...(simple.categories || [])];
+    if (simple.isCancelled) {
+      event.status = "CANCELLED";
+      if (!categories.includes(CANCELLED_CATEGORY)) {
+        categories.push(CANCELLED_CATEGORY);
+      }
+    } else {
+      event.status = "CONFIRMED";
+    }
+    event.setCategories(categories);
+
+    // Thunderbird has no native 4-state (Free/Tentative/Busy/OOF) display
+    // the way Outlook does, but setting TRANSP at least keeps "Free" time
+    // from counting as busy for anything that queries this calendar's
+    // free/busy.
+    event.setProperty("TRANSP", simple.freeBusyStatus === "Free" ? "TRANSPARENT" : "OPAQUE");
+
+    if (simple.reminderMinutesBeforeStart != null) {
+      event.addAlarm(buildReminderAlarm(simple.reminderMinutesBeforeStart));
+    }
+
     // EWS's concurrency token — required on every UpdateItem/DeleteItem
     // call. Round-tripped via a custom property since calIEvent has no
     // native concept of it; see calEventToSimple() below.
@@ -138,11 +211,13 @@
         role: a.role === "OPT-PARTICIPANT" ? "OPT-PARTICIPANT" : "REQ-PARTICIPANT",
         status: a.participationStatus || "NEEDS-ACTION",
       })),
-      // TODO: map calIAlarm -> reminderMinutesBeforeStart for push, and
-      // round-trip recurrenceInfo back to an RRULE string for edits to
-      // recurring events (see ews.js simpleToEwsItemXml for the matching
-      // TODO on the pull side).
-      reminderMinutesBeforeStart: null,
+      // Our own synthetic "Cancelled" tag (see simpleToCalEvent) isn't a
+      // real Outlook category, so it's never pushed back.
+      categories: event.getCategories().filter(c => c !== CANCELLED_CATEGORY),
+      reminderMinutesBeforeStart: getReminderMinutesBeforeStart(event),
+      // TODO: round-trip recurrenceInfo back to an RRULE string for edits
+      // to recurring events (see ews.js simpleToEwsItemXml for the
+      // matching TODO on the pull side).
       recurrenceRule: null,
     };
   }
@@ -155,7 +230,7 @@
       this.store = null;
     }
 
-    // Track which account this calendar belongs to, and bind its backing
+    // Track which calendarKey this calendar is, and bind its backing
     // store, as soon as Thunderbird assigns it a (persistent) id — both on
     // first registration and when Thunderbird recreates it from prefs on a
     // later startup. This can't happen in the constructor: until our own
@@ -167,9 +242,9 @@
     }
     set id(value) {
       super.id = value;
-      const accountId = this.getProperty("exchangeAccountId");
-      if (accountId) {
-        calendarsByAccount.set(accountId, this);
+      const calendarKey = this.getProperty("exchangeCalendarKey");
+      if (calendarKey) {
+        calendarsByKey.set(calendarKey, this);
       }
       this.bindStore();
     }
@@ -188,7 +263,7 @@
         return;
       }
       let storeId = this.getProperty("storeCalendarId");
-      // No storeId yet means either a brand-new account, or one upgrading
+      // No storeId yet means either a brand-new calendar, or one upgrading
       // from a version that used the ephemeral "memory" backing (which had
       // no such property) — either way, whatever's in background.js's
       // saved sync state no longer matches what's actually on disk here,
@@ -261,12 +336,12 @@
           Cr.NS_ERROR_NOT_AVAILABLE
         );
       }
-      const accountId = this.getProperty("exchangeAccountId");
+      const calendarKey = this.getProperty("exchangeCalendarKey");
       const requestId = cal.getUUID();
       const resultPromise = new Promise((resolve, reject) => {
         pendingLocalChanges.set(requestId, { resolve, reject });
       });
-      fireLocalChange(accountId, op, calEventToSimple(item), oldItem ? calEventToSimple(oldItem) : null, requestId);
+      fireLocalChange(calendarKey, op, calEventToSimple(item), oldItem ? calEventToSimple(oldItem) : null, requestId);
 
       let resultSimple;
       try {
@@ -292,7 +367,7 @@
     }
   }
 
-  /** Relays the inner memory calendar's notifications up to this (outer, registered) calendar's own observers. */
+  /** Relays the inner store's notifications up to this (outer, registered) calendar's own observers. */
   class RelayObserver {
     QueryInterface = ChromeUtils.generateQI(["calIObserver"]);
 
@@ -347,35 +422,35 @@
     getAPI(context) {
       return {
         exchangeCalendar: {
-          async registerCalendar(accountId, displayName) {
-            let calendar = calendarsByAccount.get(accountId);
+          async registerCalendar(calendarKey, displayName) {
+            let calendar = calendarsByKey.get(calendarKey);
             if (calendar) {
               calendar.name = displayName;
               return { calendarId: calendar.id, wasStoreReset: !!calendar.wasStoreReset };
             }
             calendar = new ExchangeEwsCalendar();
-            calendar.setProperty("exchangeAccountId", accountId);
+            calendar.setProperty("exchangeCalendarKey", calendarKey);
             calendar.name = displayName;
-            calendar.uri = Services.io.newURI(`exchangeewssync://${encodeURIComponent(accountId)}/`);
+            calendar.uri = Services.io.newURI(`exchangeewssync://${encodeURIComponent(calendarKey)}/`);
             cal.manager.registerCalendar(calendar);
-            calendarsByAccount.set(accountId, calendar);
+            calendarsByKey.set(calendarKey, calendar);
             return { calendarId: calendar.id, wasStoreReset: !!calendar.wasStoreReset };
           },
 
-          async unregisterCalendar(accountId) {
-            const calendar = calendarsByAccount.get(accountId);
+          async unregisterCalendar(calendarKey) {
+            const calendar = calendarsByKey.get(calendarKey);
             if (calendar) {
               cal.manager.unregisterCalendar(calendar);
-              calendarsByAccount.delete(accountId);
+              calendarsByKey.delete(calendarKey);
             }
-            await clearStoredCredentials(accountId);
           },
 
           // Credentials go through nsILoginManager (the same encrypted
           // store IMAP/SMTP passwords use — protected by the user's Primary
           // Password if they've set one) rather than browser.storage.local,
           // since this is a long-lived reusable domain password rather than
-          // a short-lived OAuth token.
+          // a short-lived OAuth token. Keyed by accountId (the EWS login),
+          // not calendarKey — several synced calendars can share one login.
           async saveCredentials(accountId, username, password) {
             const { origin, httpRealm } = credentialScope(accountId);
             await clearStoredCredentials(accountId);
@@ -394,10 +469,10 @@
             await clearStoredCredentials(accountId);
           },
 
-          async applyRemoteChanges(accountId, changes) {
-            const calendar = calendarsByAccount.get(accountId);
+          async applyRemoteChanges(calendarKey, changes) {
+            const calendar = calendarsByKey.get(calendarKey);
             if (!calendar) {
-              throw new Error(`exchangeCalendar: no registered calendar for account ${accountId}`);
+              throw new Error(`exchangeCalendar: no registered calendar for ${calendarKey}`);
             }
             calendar.startBatch();
             try {
