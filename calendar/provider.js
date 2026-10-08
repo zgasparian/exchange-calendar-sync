@@ -438,6 +438,16 @@
       return {
         exchangeCalendar: {
           async registerCalendar(calendarKey, displayName) {
+            // Forces Thunderbird to (re)create every calendar it has
+            // persisted from a previous session — including ones we
+            // haven't seen yet *this* run — before we decide whether
+            // calendarKey already exists. Without this, a legacy calendar
+            // Thunderbird hadn't gotten around to recreating yet (its own
+            // startup timing, independent of this WebExtension's) would
+            // look "not found" below, and we'd create a second, empty
+            // calendar instead of the `id` setter adopting the real one.
+            cal.manager.getCalendars();
+
             let calendar = calendarsByKey.get(calendarKey);
             if (calendar) {
               calendar.name = displayName;

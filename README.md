@@ -118,6 +118,21 @@ creating a duplicate alongside it. No action needed — but if you updated
 from 0.4.0 itself (not earlier) and noticed new events silently stopped
 syncing while old ones remained, that's exactly this bug; 0.4.1 fixes it.
 
+**0.4.1 had its own bug in that same fix**: `registerCalendar()` only
+checked its own in-memory map for an existing calendar, without forcing
+Thunderbird to finish recreating calendars it hadn't gotten to yet this
+session — a timing race, independent of this add-on, between Thunderbird's
+own startup and this WebExtension's. Losing that race meant a second,
+*empty* calendar got created alongside the real one, and depending on
+which one Thunderbird happened to show as active, it could look like
+every event had vanished. 0.4.2 forces `cal.manager.getCalendars()`
+(which synchronously recreates everything Thunderbird has persisted)
+before checking, closing the race. If you hit this on 0.4.1, check your
+Calendar list for a duplicate "Calendar" entry — if there is one, confirm
+which one is actually empty (click into it) and delete that one; your
+real data is in the other one (and, regardless, always safe on the
+Exchange server itself).
+
 ## 1. Confirm EWS is reachable (IT-side check)
 
 Ask whoever administers the Exchange server:
