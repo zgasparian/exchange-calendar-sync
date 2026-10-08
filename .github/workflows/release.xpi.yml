@@ -1,0 +1,43 @@
+name: Build and release XPI
+
+# Triggered by pushing a tag like "v0.3.1" — which must match manifest.json's
+# "version" field exactly (checked below) so the release and the installed
+# add-on's reported version never drift apart.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version from manifest.json
+        id: manifest
+        run: echo "version=$(jq -r .version manifest.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag matches manifest version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          manifest_version="${{ steps.manifest.outputs.version }}"
+          if [ "$tag_version" != "$manifest_version" ]; then
+            echo "Tag is v$tag_version but manifest.json says $manifest_version — bump one to match the other." >&2
+            exit 1
+          fi
+
+      - name: Build xpi
+        run: |
+          zip -r -X "exchange-calendar-sync-${{ steps.manifest.outputs.version }}.xpi" . \
+            -x ".git/*" ".github/*" ".gitignore"
+
+      - name: Create release and attach xpi
+        uses: softprops/action-gh-release@v2
+        with:
+          files: exchange-calendar-sync-*.xpi
+          generate_release_notes: true
