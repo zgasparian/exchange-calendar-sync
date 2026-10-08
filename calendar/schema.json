@@ -1,0 +1,104 @@
+[
+  {
+    "namespace": "exchangeCalendar",
+    "description": "Bridges the unprivileged background page to Thunderbird's calendar manager and credential store. All EWS networking happens in background.js + calendar/ews.js; this API only ever touches calICalendar and nsILoginManager.",
+    "functions": [
+      {
+        "name": "registerCalendar",
+        "type": "function",
+        "description": "Creates (if needed) and registers the Thunderbird calendar for this account, or updates its display name if it already exists.",
+        "async": true,
+        "parameters": [
+          { "name": "accountId", "type": "string" },
+          { "name": "displayName", "type": "string" }
+        ]
+      },
+      {
+        "name": "unregisterCalendar",
+        "type": "function",
+        "description": "Removes the Thunderbird calendar associated with this account and clears its stored credentials.",
+        "async": true,
+        "parameters": [
+          { "name": "accountId", "type": "string" }
+        ]
+      },
+      {
+        "name": "applyRemoteChanges",
+        "type": "function",
+        "description": "Applies a batch of changes fetched from the EWS server (add/modify/delete) to the local calendar cache, notifying Thunderbird's UI.",
+        "async": true,
+        "parameters": [
+          { "name": "accountId", "type": "string" },
+          {
+            "name": "changes",
+            "type": "array",
+            "items": { "type": "any" }
+          }
+        ]
+      },
+      {
+        "name": "resolveLocalChange",
+        "type": "function",
+        "description": "Called by background.js after it successfully pushed a user-made local edit to the EWS server, with the server's final version of the item.",
+        "async": true,
+        "parameters": [
+          { "name": "requestId", "type": "string" },
+          { "name": "resultItem", "type": "any" }
+        ]
+      },
+      {
+        "name": "rejectLocalChange",
+        "type": "function",
+        "description": "Called by background.js if pushing a user-made local edit to the EWS server failed.",
+        "async": true,
+        "parameters": [
+          { "name": "requestId", "type": "string" },
+          { "name": "message", "type": "string" }
+        ]
+      },
+      {
+        "name": "saveCredentials",
+        "type": "function",
+        "description": "Stores (replacing any existing) the EWS username/password for this account in nsILoginManager.",
+        "async": true,
+        "parameters": [
+          { "name": "accountId", "type": "string" },
+          { "name": "username", "type": "string" },
+          { "name": "password", "type": "string" }
+        ]
+      },
+      {
+        "name": "getCredentials",
+        "type": "function",
+        "description": "Returns the stored {username, password} for this account, or null if none is stored.",
+        "async": true,
+        "parameters": [
+          { "name": "accountId", "type": "string" }
+        ]
+      },
+      {
+        "name": "deleteCredentials",
+        "type": "function",
+        "description": "Removes any stored credentials for this account.",
+        "async": true,
+        "parameters": [
+          { "name": "accountId", "type": "string" }
+        ]
+      }
+    ],
+    "events": [
+      {
+        "name": "onLocalChange",
+        "type": "function",
+        "description": "Fired when the Thunderbird user adds, edits, or deletes an event directly in the calendar UI, so background.js can push it to the EWS server.",
+        "parameters": [
+          { "name": "accountId", "type": "string" },
+          { "name": "op", "type": "string", "enum": ["add", "modify", "delete"] },
+          { "name": "item", "type": "any" },
+          { "name": "oldItem", "type": "any", "optional": true },
+          { "name": "requestId", "type": "string" }
+        ]
+      }
+    ]
+  }
+]

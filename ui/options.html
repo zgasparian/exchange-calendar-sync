@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Exchange Calendar Sync</title>
+  <style>
+    body { font: 14px -apple-system, "Segoe UI", sans-serif; margin: 24px; max-width: 640px; color: #1a1a1a; }
+    h1 { font-size: 18px; margin-bottom: 4px; }
+    .hint { color: #555; margin-bottom: 20px; }
+    fieldset { border: 1px solid #ccc; border-radius: 6px; padding: 16px; margin-bottom: 20px; }
+    legend { font-weight: 600; padding: 0 4px; }
+    label { display: block; margin-top: 10px; font-weight: 500; }
+    input[type="text"], input[type="password"], input[type="number"] { width: 100%; padding: 6px; margin-top: 4px; box-sizing: border-box; }
+    input[type="number"] { max-width: 120px; }
+    .field-hint { color: #777; font-size: 12px; margin-top: 2px; }
+    button { margin-top: 14px; padding: 8px 14px; cursor: pointer; }
+    #accounts { list-style: none; padding: 0; }
+    #accounts li { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid #eee; }
+    .acct-meta { display: flex; flex-direction: column; }
+    .acct-url { color: #555; font-size: 12px; }
+    .warn { color: #b94a00; font-size: 12px; }
+    .status { margin-top: 12px; font-size: 13px; }
+    .status.error { color: #b00020; }
+    .status.ok { color: #0b6b2b; }
+    button.remove { background: none; border: 1px solid #b00020; color: #b00020; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>Exchange Calendar Sync</h1>
+  <p class="hint">Connect your on-premises Exchange Server mailbox and sync its calendar into Thunderbird via EWS.</p>
+
+  <fieldset>
+    <legend>Connect a mailbox</legend>
+    <label for="url">Outlook Web App (OWA) address</label>
+    <input type="text" id="url" placeholder="https://mail.yourcompany.com/owa" />
+    <div class="field-hint">The same address you'd use to check mail in a browser. Only the server name is used — the EWS endpoint is derived from it automatically.</div>
+
+    <label for="username">Username</label>
+    <input type="text" id="username" placeholder="DOMAIN\jsmith or jsmith@yourcompany.com" />
+    <div class="field-hint">Use whatever you'd type into Outlook's login prompt for this server.</div>
+
+    <label for="password">Password</label>
+    <input type="password" id="password" />
+
+    <button id="connect">Connect account…</button>
+    <div id="loginStatus" class="status"></div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Sync frequency</legend>
+    <label for="syncInterval">Check for changes every (minutes)</label>
+    <input type="number" id="syncInterval" min="1" step="1" />
+    <div class="field-hint">Applies to every connected account. Local edits in Thunderbird still push to the server immediately, regardless of this setting.</div>
+    <button id="saveInterval">Save</button>
+    <div id="intervalStatus" class="status"></div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Connected accounts</legend>
+    <ul id="accounts"></ul>
+  </fieldset>
+
+  <p class="hint">Developed by Zareh Kasparian, with Claude Code support.</p>
+
+  <script src="options.js"></script>
+</body>
+</html>

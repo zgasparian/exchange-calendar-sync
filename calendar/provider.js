@@ -1,0 +1,442 @@
+/*
+ * provider.js — the privileged "parent" half of the exchangeCalendar
+ * Experiment API (see manifest.json's experiment_apis.exchangeCalendar and
+ * calendar/schema.json). This is the ONLY file in this extension that runs
+ * with full Thunderbird/Gecko privileges (XPCOM, ChromeUtils, Services).
+ *
+ * It does no networking at all — that's background.js + calendar/ews.js,
+ * running as a normal unprivileged WebExtension background page (ews.js
+ * talks to the on-premises Exchange server's EWS SOAP endpoint). This file
+ * only ever talks to Thunderbird's calendar manager, plus nsILoginManager
+ * for credential storage:
+ *
+ *   - registers a calICalendar type ("exchangeEwsSync") and, per account,
+ *     one calICalendar instance backed by an internal "memory" calendar
+ *     (the same delegation trick Thunderbird's own in-progress native
+ *     GraphCalendar.sys.mjs prototype uses for storage);
+ *   - applyRemoteChanges() lets background.js push what it fetched from
+ *     EWS into that store, which fires the normal onAddItem/onModifyItem/
+ *     onDeleteItem notifications so open calendar views update live;
+ *   - when the *user* adds/edits/deletes an event in Thunderbird's own UI,
+ *     this fires onLocalChange out to background.js, which pushes it to
+ *     the server and calls back resolveLocalChange()/rejectLocalChange();
+ *   - saveCredentials()/getCredentials()/deleteCredentials() store the
+ *     EWS username+password in nsILoginManager (the same encrypted store
+ *     IMAP/SMTP passwords use), since background.js is unprivileged and
+ *     can't reach it directly.
+ *
+ * The calICalendar contract used here (promise-based addItem/modifyItem/
+ * deleteItem/getItem, cal.provider.BaseClass, cal.manager.register*) was
+ * verified against this machine's installed Thunderbird 156 by extracting
+ * omni.ja and reading CalCalendarManager.sys.mjs, calProviderUtils.sys.mjs,
+ * CalDavCalendar.sys.mjs and the (unfinished, read-only) native
+ * GraphCalendar.sys.mjs — not guessed from memory. Still, if a future
+ * Thunderbird version changes this contract, this file is where to look.
+ */
+
+(function (exports) {
+  "use strict";
+
+  const { cal } = ChromeUtils.importESModule("resource:///modules/calendar/calUtils.sys.mjs");
+  const { CalEvent } = ChromeUtils.importESModule("resource:///modules/CalEvent.sys.mjs");
+  const { CalAttendee } = ChromeUtils.importESModule("resource:///modules/CalAttendee.sys.mjs");
+  const { CalRecurrenceInfo } = ChromeUtils.importESModule("resource:///modules/CalRecurrenceInfo.sys.mjs");
+  const { CalRecurrenceRule } = ChromeUtils.importESModule("resource:///modules/CalRecurrenceRule.sys.mjs");
+
+  const CALENDAR_TYPE = "exchangeEwsSync";
+
+  // Synthetic (never dereferenced) origin used as the nsILoginManager lookup
+  // key for an account's EWS credentials — one entry per accountId.
+  function credentialScope(accountId) {
+    return { origin: `exchangecalendarsync://${encodeURIComponent(accountId)}`, httpRealm: "ews" };
+  }
+
+  async function clearStoredCredentials(accountId) {
+    const { origin, httpRealm } = credentialScope(accountId);
+    for (const existing of await Services.logins.searchLoginsAsync({ origin, httpRealm })) {
+      await Services.logins.removeLoginAsync(existing);
+    }
+  }
+
+  // accountId -> ExchangeEwsCalendar instance (repopulated as calendars
+  // are (re)created, see the `id` setter override below).
+  const calendarsByAccount = new Map();
+
+  // requestId -> {resolve, reject}, for addItem/modifyItem/deleteItem calls
+  // that are waiting on background.js to finish talking to the EWS server.
+  const pendingLocalChanges = new Map();
+
+  // Set by getAPI()'s onLocalChange EventManager while background.js has a
+  // listener registered (effectively always, once the add-on has started).
+  let fireLocalChange = null;
+
+  function simpleToCalEvent(simple) {
+    const event = new CalEvent();
+    event.id = simple.id;
+    event.title = simple.title || "";
+    event.descriptionText = simple.description || "";
+    if (simple.location) {
+      event.setProperty("LOCATION", simple.location);
+    }
+    event.startDate = cal.dtz.fromRFC3339(simple.startISO, cal.dtz.UTC);
+    event.endDate = cal.dtz.fromRFC3339(simple.endISO, cal.dtz.UTC);
+    if (simple.isAllDay) {
+      event.startDate.isDate = true;
+      event.endDate.isDate = true;
+    }
+    if (simple.organizer) {
+      const organizer = new CalAttendee();
+      organizer.id = `mailto:${simple.organizer.email}`;
+      organizer.commonName = simple.organizer.name;
+      organizer.isOrganizer = true;
+      event.organizer = organizer;
+    }
+    for (const a of simple.attendees || []) {
+      const attendee = new CalAttendee();
+      attendee.id = `mailto:${a.email}`;
+      attendee.commonName = a.name;
+      attendee.role = a.role || "REQ-PARTICIPANT";
+      attendee.participationStatus = a.status || "NEEDS-ACTION";
+      event.addAttendee(attendee);
+    }
+    if (simple.recurrenceRule) {
+      try {
+        const recInfo = new CalRecurrenceInfo(event);
+        const rule = new CalRecurrenceRule();
+        rule.icalString = `RRULE:${simple.recurrenceRule}`;
+        recInfo.appendRecurrenceItem(rule);
+        event.recurrenceInfo = recInfo;
+      } catch (e) {
+        console.error("exchangeCalendar: could not apply recurrence rule", simple.recurrenceRule, e);
+      }
+    }
+    // EWS's concurrency token — required on every UpdateItem/DeleteItem
+    // call. Round-tripped via a custom property since calIEvent has no
+    // native concept of it; see calEventToSimple() below.
+    if (simple.changeKey) {
+      event.setProperty("X-EWS-CHANGEKEY", simple.changeKey);
+    }
+    return event;
+  }
+
+  function calEventToSimple(event) {
+    return {
+      id: event.id,
+      changeKey: event.getProperty("X-EWS-CHANGEKEY") || null,
+      title: event.title || "",
+      description: event.descriptionText || "",
+      location: event.getProperty("LOCATION") || null,
+      startISO: cal.dtz.toRFC3339(event.startDate.getInTimezone(cal.dtz.UTC)),
+      endISO: cal.dtz.toRFC3339(event.endDate.getInTimezone(cal.dtz.UTC)),
+      isAllDay: !!event.startDate.isDate,
+      organizer: event.organizer
+        ? { name: event.organizer.commonName, email: (event.organizer.id || "").replace(/^mailto:/i, "") }
+        : null,
+      attendees: event.getAttendees().map(a => ({
+        name: a.commonName,
+        email: (a.id || "").replace(/^mailto:/i, ""),
+        role: a.role === "OPT-PARTICIPANT" ? "OPT-PARTICIPANT" : "REQ-PARTICIPANT",
+        status: a.participationStatus || "NEEDS-ACTION",
+      })),
+      // TODO: map calIAlarm -> reminderMinutesBeforeStart for push, and
+      // round-trip recurrenceInfo back to an RRULE string for edits to
+      // recurring events (see ews.js simpleToEwsItemXml for the matching
+      // TODO on the pull side).
+      reminderMinutesBeforeStart: null,
+      recurrenceRule: null,
+    };
+  }
+
+  class ExchangeEwsCalendar extends cal.provider.BaseClass {
+    constructor() {
+      super();
+      this.initProviderBase();
+      // Bound lazily in the `id` setter below — see bindStore().
+      this.store = null;
+    }
+
+    // Track which account this calendar belongs to, and bind its backing
+    // store, as soon as Thunderbird assigns it a (persistent) id — both on
+    // first registration and when Thunderbird recreates it from prefs on a
+    // later startup. This can't happen in the constructor: until our own
+    // id is set, getProperty()/setProperty() have nothing to persist to
+    // (see cal.provider.BaseClass), so we couldn't remember the store's id
+    // across restarts.
+    get id() {
+      return super.id;
+    }
+    set id(value) {
+      super.id = value;
+      const accountId = this.getProperty("exchangeAccountId");
+      if (accountId) {
+        calendarsByAccount.set(accountId, this);
+      }
+      this.bindStore();
+    }
+
+    // Backs this calendar with a real, persistent "storage" (SQLite)
+    // calendar instead of the ephemeral "memory" type that earlier
+    // versions used — "memory" never writes to disk, so every synced
+    // event vanished on every Thunderbird restart even though the calendar
+    // registration itself (being prefs-backed) survived. This reuses the
+    // same shared moz-storage-calendar database every local/offline
+    // calendar in the profile uses, under a stable id of our own so we
+    // find the same rows again on the next startup.
+    bindStore() {
+      if (this.store) {
+        this.wasStoreReset = false;
+        return;
+      }
+      let storeId = this.getProperty("storeCalendarId");
+      // No storeId yet means either a brand-new account, or one upgrading
+      // from a version that used the ephemeral "memory" backing (which had
+      // no such property) — either way, whatever's in background.js's
+      // saved sync state no longer matches what's actually on disk here,
+      // so registerCalendar() reports this back for it to force a full
+      // resync rather than a delta one.
+      this.wasStoreReset = !storeId;
+      if (!storeId) {
+        storeId = cal.getUUID();
+        this.setProperty("storeCalendarId", storeId);
+      }
+      const store = Cc["@mozilla.org/calendar/calendar;1?type=storage"].createInstance(Ci.calICalendar);
+      store.superCalendar = this;
+      store.uri = Services.io.newURI("moz-storage-calendar://");
+      store.id = storeId;
+      store.addObserver(new RelayObserver(this));
+      this.store = store;
+    }
+
+    get type() {
+      return CALENDAR_TYPE;
+    }
+
+    get canRefresh() {
+      // We're push/pull-synced by background.js on its own alarm schedule,
+      // not by Thunderbird calling refresh(); see README.
+      return false;
+    }
+
+    getItems(itemFilter, count, rangeStart, rangeEnd) {
+      return this.store.getItems(itemFilter, count, rangeStart, rangeEnd);
+    }
+
+    async getItem(id) {
+      return this.store.getItem(id);
+    }
+
+    async applyRemoteChange(change) {
+      const { item } = change;
+      const existing = await this.store.getItem(item.id);
+      if (change.op === "delete" || item.removed) {
+        if (existing) {
+          await this.store.deleteItem(existing);
+        }
+        return;
+      }
+      const calEvent = simpleToCalEvent(item);
+      if (existing) {
+        await this.store.modifyItem(calEvent, existing);
+      } else {
+        await this.store.addItem(calEvent);
+      }
+    }
+
+    async addItem(item) {
+      return this.pushLocalChange("add", item, null);
+    }
+
+    async modifyItem(newItem, oldItem) {
+      return this.pushLocalChange("modify", newItem, oldItem);
+    }
+
+    async deleteItem(item) {
+      return this.pushLocalChange("delete", item, null);
+    }
+
+    async pushLocalChange(op, item, oldItem) {
+      if (!fireLocalChange) {
+        throw new Components.Exception(
+          "Exchange Calendar Sync's background page isn't running",
+          Cr.NS_ERROR_NOT_AVAILABLE
+        );
+      }
+      const accountId = this.getProperty("exchangeAccountId");
+      const requestId = cal.getUUID();
+      const resultPromise = new Promise((resolve, reject) => {
+        pendingLocalChanges.set(requestId, { resolve, reject });
+      });
+      fireLocalChange(accountId, op, calEventToSimple(item), oldItem ? calEventToSimple(oldItem) : null, requestId);
+
+      let resultSimple;
+      try {
+        resultSimple = await resultPromise;
+      } finally {
+        pendingLocalChanges.delete(requestId);
+      }
+
+      if (op === "delete") {
+        const existing = await this.store.getItem(item.id);
+        if (existing) {
+          await this.store.deleteItem(existing);
+        }
+        return null;
+      }
+
+      const calEvent = simpleToCalEvent(resultSimple);
+      const existing = await this.store.getItem(calEvent.id);
+      if (existing) {
+        return this.store.modifyItem(calEvent, existing);
+      }
+      return this.store.addItem(calEvent);
+    }
+  }
+
+  /** Relays the inner memory calendar's notifications up to this (outer, registered) calendar's own observers. */
+  class RelayObserver {
+    QueryInterface = ChromeUtils.generateQI(["calIObserver"]);
+
+    constructor(calendar) {
+      this.calendar = calendar;
+    }
+    onStartBatch() {
+      this.calendar.observers.notify("onStartBatch", [this.calendar]);
+    }
+    onEndBatch() {
+      this.calendar.observers.notify("onEndBatch", [this.calendar]);
+    }
+    onLoad() {
+      this.calendar.observers.notify("onLoad", [this.calendar]);
+    }
+    onAddItem(item) {
+      this.calendar.observers.notify("onAddItem", [item]);
+    }
+    onModifyItem(newItem, oldItem) {
+      this.calendar.observers.notify("onModifyItem", [newItem, oldItem]);
+    }
+    onDeleteItem(item) {
+      this.calendar.observers.notify("onDeleteItem", [item]);
+    }
+    onError(calendar, errNo, message) {
+      this.calendar.observers.notify("onError", [this.calendar, errNo, message]);
+    }
+    onPropertyChanged(calendar, name, value, oldValue) {
+      this.calendar.observers.notify("onPropertyChanged", [this.calendar, name, value, oldValue]);
+    }
+    onPropertyDeleting(calendar, name) {
+      this.calendar.observers.notify("onPropertyDeleting", [this.calendar, name]);
+    }
+  }
+
+  if (!cal.manager.hasCalendarProvider(CALENDAR_TYPE)) {
+    cal.manager.registerCalendarProvider(CALENDAR_TYPE, ExchangeEwsCalendar);
+  }
+
+  class ExchangeCalendarAPI extends ExtensionCommon.ExtensionAPI {
+    onShutdown(isAppShutdown) {
+      if (isAppShutdown) {
+        return;
+      }
+      try {
+        cal.manager.unregisterCalendarProvider(CALENDAR_TYPE, true);
+      } catch (e) {
+        console.error("exchangeCalendar: unregister on shutdown failed", e);
+      }
+    }
+
+    getAPI(context) {
+      return {
+        exchangeCalendar: {
+          async registerCalendar(accountId, displayName) {
+            let calendar = calendarsByAccount.get(accountId);
+            if (calendar) {
+              calendar.name = displayName;
+              return { calendarId: calendar.id, wasStoreReset: !!calendar.wasStoreReset };
+            }
+            calendar = new ExchangeEwsCalendar();
+            calendar.setProperty("exchangeAccountId", accountId);
+            calendar.name = displayName;
+            calendar.uri = Services.io.newURI(`exchangeewssync://${encodeURIComponent(accountId)}/`);
+            cal.manager.registerCalendar(calendar);
+            calendarsByAccount.set(accountId, calendar);
+            return { calendarId: calendar.id, wasStoreReset: !!calendar.wasStoreReset };
+          },
+
+          async unregisterCalendar(accountId) {
+            const calendar = calendarsByAccount.get(accountId);
+            if (calendar) {
+              cal.manager.unregisterCalendar(calendar);
+              calendarsByAccount.delete(accountId);
+            }
+            await clearStoredCredentials(accountId);
+          },
+
+          // Credentials go through nsILoginManager (the same encrypted
+          // store IMAP/SMTP passwords use — protected by the user's Primary
+          // Password if they've set one) rather than browser.storage.local,
+          // since this is a long-lived reusable domain password rather than
+          // a short-lived OAuth token.
+          async saveCredentials(accountId, username, password) {
+            const { origin, httpRealm } = credentialScope(accountId);
+            await clearStoredCredentials(accountId);
+            const loginInfo = Cc["@mozilla.org/login-manager/loginInfo;1"].createInstance(Ci.nsILoginInfo);
+            loginInfo.init(origin, null, httpRealm, username, password, "", "");
+            await Services.logins.addLoginAsync(loginInfo);
+          },
+
+          async getCredentials(accountId) {
+            const { origin, httpRealm } = credentialScope(accountId);
+            const [login] = await Services.logins.searchLoginsAsync({ origin, httpRealm });
+            return login ? { username: login.username, password: login.password } : null;
+          },
+
+          async deleteCredentials(accountId) {
+            await clearStoredCredentials(accountId);
+          },
+
+          async applyRemoteChanges(accountId, changes) {
+            const calendar = calendarsByAccount.get(accountId);
+            if (!calendar) {
+              throw new Error(`exchangeCalendar: no registered calendar for account ${accountId}`);
+            }
+            calendar.startBatch();
+            try {
+              for (const change of changes) {
+                await calendar.applyRemoteChange(change);
+              }
+            } finally {
+              calendar.endBatch();
+            }
+          },
+
+          async resolveLocalChange(requestId, resultItem) {
+            const pending = pendingLocalChanges.get(requestId);
+            if (pending) {
+              pending.resolve(resultItem);
+            }
+          },
+
+          async rejectLocalChange(requestId, message) {
+            const pending = pendingLocalChanges.get(requestId);
+            if (pending) {
+              pending.reject(new Error(message));
+            }
+          },
+
+          onLocalChange: new ExtensionCommon.EventManager({
+            context,
+            name: "exchangeCalendar.onLocalChange",
+            register(fire) {
+              fireLocalChange = (...args) => fire.async(...args);
+              return () => {
+                fireLocalChange = null;
+              };
+            },
+          }).api(),
+        },
+      };
+    }
+  }
+
+  exports.exchangeCalendar = ExchangeCalendarAPI;
+})(this);
