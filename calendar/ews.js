@@ -210,6 +210,7 @@ class EwsClient {
       `<t:FieldURI FieldURI="calendar:RequiredAttendees"/>` +
       `<t:FieldURI FieldURI="calendar:OptionalAttendees"/>` +
       `<t:FieldURI FieldURI="calendar:UID"/>` +
+      `<t:FieldURI FieldURI="calendar:Recurrence"/>` +
       `<t:FieldURI FieldURI="calendar:LegacyFreeBusyStatus"/>` +
       `<t:FieldURI FieldURI="calendar:MyResponseType"/>` +
       `<t:FieldURI FieldURI="calendar:IsOnlineMeeting"/>` +
@@ -250,6 +251,43 @@ class EwsClient {
       syncState: syncStateEl?.textContent || syncState,
       moreAvailable: moreEl ? moreEl.textContent !== "true" : false,
     };
+  }
+
+  /**
+   * Fetches every event occurrence between two dates using FindItem with a
+   * CalendarView, which the server expands itself: recurring series come
+   * back as individual occurrences (with deleted/moved ones already
+   * applied), unlike SyncFolderItems which only returns the series master.
+   *
+   * @returns {object[]} SimpleEvents
+   */
+  async getCalendarView(folderRef, startDate, endDate) {
+    const body =
+      `<m:FindItem Traversal="Shallow">` +
+      `<m:ItemShape><t:BaseShape>Default</t:BaseShape>` +
+      `<t:AdditionalProperties>` +
+      `<t:FieldURI FieldURI="calendar:Start"/>` +
+      `<t:FieldURI FieldURI="calendar:End"/>` +
+      `<t:FieldURI FieldURI="calendar:Location"/>` +
+      `<t:FieldURI FieldURI="calendar:IsAllDayEvent"/>` +
+      `<t:FieldURI FieldURI="calendar:IsCancelled"/>` +
+      `<t:FieldURI FieldURI="item:ReminderMinutesBeforeStart"/>` +
+      `<t:FieldURI FieldURI="item:ReminderIsSet"/>` +
+      `<t:FieldURI FieldURI="item:Categories"/>` +
+      `<t:FieldURI FieldURI="calendar:Organizer"/>` +
+      `<t:FieldURI FieldURI="calendar:RequiredAttendees"/>` +
+      `<t:FieldURI FieldURI="calendar:OptionalAttendees"/>` +
+      `<t:FieldURI FieldURI="calendar:LegacyFreeBusyStatus"/>` +
+      `<t:FieldURI FieldURI="calendar:MyResponseType"/>` +
+      `<t:FieldURI FieldURI="calendar:IsOnlineMeeting"/>` +
+      `<t:FieldURI FieldURI="calendar:JoinOnlineMeetingUrl"/>` +
+      `</t:AdditionalProperties></m:ItemShape>` +
+      `<m:CalendarView MaxEntriesReturned="2000" StartDate="${startDate.toISOString()}" EndDate="${endDate.toISOString()}"/>` +
+      `<m:ParentFolderIds>${folderRefXml(folderRef)}</m:ParentFolderIds>` +
+      `</m:FindItem>`;
+    const doc = await this.soapRequest(body);
+    this.assertSuccess(doc, "FindItem (CalendarView)");
+    return [...doc.getElementsByTagNameNS(TYPES_NS, "CalendarItem")].map(ewsItemToSimple);
   }
 
   async createEvent(folderRef, simpleEvent) {
@@ -406,12 +444,84 @@ function ewsItemToSimple(item) {
     isOnlineMeeting: text(item, "IsOnlineMeeting") === "true",
     onlineMeetingUrl: text(item, "JoinOnlineMeetingUrl"),
     reminderMinutesBeforeStart: isReminderOn ? parseInt(text(item, "ReminderMinutesBeforeStart") || "0", 10) : null,
-    // TODO: recurrence — EWS exposes this via <t:Recurrence> (RelativeYearlyRecurrence,
-    // AbsoluteMonthlyRecurrence, etc.) plus separate IsRecurring/CalendarItemType
-    // fields, structurally different enough from Graph's `recurrence` object that
-    // it needs its own mapping. Left out of v1; see README "Known limitations".
-    recurrenceRule: null,
+    // Deleted/modified single occurrences of a series are not mapped (no
+    // EXDATE support); see README "Known limitations".
+    recurrenceRule: ewsRecurrenceToRrule(item.getElementsByTagNameNS(TYPES_NS, "Recurrence")[0]),
   };
+}
+
+const EWS_DAY_TO_RRULE = {
+  Sunday: "SU", Monday: "MO", Tuesday: "TU", Wednesday: "WE", Thursday: "TH", Friday: "FR", Saturday: "SA",
+};
+const EWS_MONTHS = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December",
+];
+const EWS_WEEK_INDEX = { First: 1, Second: 2, Third: 3, Fourth: 4, Last: -1 };
+
+/** "Monday Wednesday" / "Weekday" / "Day" -> ["MO","WE"] etc. */
+function ewsDaysToRrule(daysOfWeek) {
+  const days = [];
+  for (const d of (daysOfWeek || "").split(/\s+/).filter(Boolean)) {
+    if (d === "Weekday") {
+      days.push("MO", "TU", "WE", "TH", "FR");
+    } else if (d === "WeekendDay") {
+      days.push("SA", "SU");
+    } else if (d === "Day") {
+      days.push("MO", "TU", "WE", "TH", "FR", "SA", "SU");
+    } else if (EWS_DAY_TO_RRULE[d]) {
+      days.push(EWS_DAY_TO_RRULE[d]);
+    }
+  }
+  return days;
+}
+
+/** Converts an EWS <t:Recurrence> element into an iCalendar RRULE value (without the "RRULE:" prefix), or null. */
+function ewsRecurrenceToRrule(recEl) {
+  if (!recEl) {
+    return null;
+  }
+  const child = name => recEl.getElementsByTagNameNS(TYPES_NS, name)[0];
+  const interval = parseInt(text(recEl, "Interval") || "1", 10);
+  const days = ewsDaysToRrule(text(recEl, "DaysOfWeek"));
+  const index = EWS_WEEK_INDEX[text(recEl, "DayOfWeekIndex")];
+  const monthNum = EWS_MONTHS.indexOf(text(recEl, "Month")) + 1;
+  // "Day"/"Weekday"/"WeekendDay" with an index (e.g. last weekday) needs BYSETPOS.
+  const nthOfSet = days.length > 1 && index != null;
+  const nthDay = days.length === 1 && index != null ? `${index}${days[0]}` : null;
+
+  let parts;
+  if (child("DailyRecurrence")) {
+    parts = ["FREQ=DAILY", `INTERVAL=${interval}`];
+  } else if (child("WeeklyRecurrence")) {
+    parts = ["FREQ=WEEKLY", `INTERVAL=${interval}`, days.length ? `BYDAY=${days.join(",")}` : null];
+  } else if (child("AbsoluteMonthlyRecurrence")) {
+    parts = ["FREQ=MONTHLY", `INTERVAL=${interval}`, `BYMONTHDAY=${text(recEl, "DayOfMonth")}`];
+  } else if (child("RelativeMonthlyRecurrence")) {
+    parts = ["FREQ=MONTHLY", `INTERVAL=${interval}`, nthDay ? `BYDAY=${nthDay}` : `BYDAY=${days.join(",")}`];
+    if (nthOfSet) {
+      parts.push(`BYSETPOS=${index}`);
+    }
+  } else if (child("AbsoluteYearlyRecurrence")) {
+    parts = ["FREQ=YEARLY", `BYMONTH=${monthNum}`, `BYMONTHDAY=${text(recEl, "DayOfMonth")}`];
+  } else if (child("RelativeYearlyRecurrence")) {
+    parts = ["FREQ=YEARLY", `BYMONTH=${monthNum}`, nthDay ? `BYDAY=${nthDay}` : `BYDAY=${days.join(",")}`];
+    if (nthOfSet) {
+      parts.push(`BYSETPOS=${index}`);
+    }
+  } else {
+    return null;
+  }
+
+  if (child("NumberedRecurrence")) {
+    parts.push(`COUNT=${text(recEl, "NumberOfOccurrences")}`);
+  } else if (child("EndDateRecurrence")) {
+    const endDate = (text(recEl, "EndDate") || "").slice(0, 10).replace(/-/g, "");
+    if (endDate) {
+      parts.push(`UNTIL=${endDate}T235959Z`);
+    }
+  }
+  return parts.filter(Boolean).join(";");
 }
 
 /** Reverse of ewsItemToSimple(), wrapped in a <t:CalendarItem> for CreateItem. */

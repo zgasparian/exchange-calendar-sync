@@ -189,12 +189,10 @@ settings, so the permission can't be scoped narrower ahead of time.
 
 ## Known limitations (v1)
 
-- **Recurrence isn't implemented yet.** EWS exposes recurring events via a
-  `<t:Recurrence>` element that's structurally different from a simple
-  RRULE string, and needs its own mapping — left as a `TODO` in
-  `calendar/ews.js` (`ewsItemToSimple`/`simpleToEwsItemXml`). Recurring
-  events on the server currently won't sync correctly; non-recurring
-  events are unaffected.
+- **Recurrence is pull-only.** Events are synced as individual occurrences
+  from 6 months back to 12 months ahead (EWS `CalendarView`, which the server
+  expands itself). Creating/editing a recurring series from Thunderbird saves
+  a single instance.
 - **Free/busy has no dedicated UI.** Thunderbird doesn't render Outlook's
   4-state (Free/Tentative/Busy/OOF) color coding, so the
   `LegacyFreeBusyStatus` → `TRANSP` mapping is real but mostly invisible

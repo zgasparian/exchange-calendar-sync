@@ -193,22 +193,43 @@ async function syncCalendar(calendarKey) {
   // Suppresses notifications on a calendar's very first sync — otherwise
   // connecting an account with months of history would fire a desktop
   // notification for every single existing meeting.
-  const isInitialSync = !calendar.syncState;
+  const isInitialSync = !calendar.lastSyncedAt || !calendar.knownEvents;
   try {
-    let syncState = calendar.syncState;
-    let moreAvailable = true;
-    while (moreAvailable) {
-      const result = await client.syncFolderItems(calendar.folderRef, syncState);
-      if (result.changes.length) {
-        await browser.exchangeCalendar.applyRemoteChanges(calendarKey, result.changes);
-        if (!isInitialSync) {
-          notifyForChanges(calendar, result.changes);
-        }
+    // Window sync via CalendarView: the server expands recurring series
+    // into individual occurrences, which SyncFolderItems cannot do.
+    // `knownEvents` (id -> changeKey) lets us push only what changed and
+    // delete what disappeared from the server or left the window.
+    const DAY = 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    const items = await client.getCalendarView(
+      calendar.folderRef,
+      new Date(now - 180 * DAY),
+      new Date(now + 365 * DAY)
+    );
+    const known = calendar.knownEvents || {};
+    const changes = [];
+    const nextKnown = {};
+    for (const item of items) {
+      nextKnown[item.id] = item.changeKey;
+      if (!(item.id in known)) {
+        changes.push({ op: "create", item });
+      } else if (known[item.id] !== item.changeKey) {
+        changes.push({ op: "update", item });
       }
-      syncState = result.syncState;
-      moreAvailable = result.moreAvailable;
     }
-    calendar.syncState = syncState;
+    for (const id of Object.keys(known)) {
+      if (!(id in nextKnown)) {
+        changes.push({ op: "delete", item: { id, removed: true } });
+      }
+    }
+    if (changes.length) {
+      await browser.exchangeCalendar.applyRemoteChanges(calendarKey, changes);
+      if (!isInitialSync) {
+        notifyForChanges(calendar, changes);
+      }
+    }
+    console.log(`exchangeCalendar: ${calendarKey} synced ${items.length} occurrences, ${changes.length} changes`);
+    calendar.knownEvents = nextKnown;
     calendar.needsReauth = false;
     calendar.lastSyncedAt = Date.now();
     await saveCalendars(calendars);
@@ -311,6 +332,7 @@ async function restoreOnStartup() {
       // server-side changes" and leave the calendar empty forever; force
       // a full resync instead.
       calendar.syncState = null;
+      calendar.knownEvents = null;
     }
   }
   await saveCalendars(calendars);
