@@ -1,0 +1,18 @@
+{
+  "addons": {
+    "exchange-calendar-sync@zareh.local": {
+      "updates": [
+        {
+          "version": "0.4.10",
+          "update_link": "https://github.com/zgasparian/exchange-calendar-sync/releases/download/v0.4.10/exchange-calendar-sync-0.4.10.xpi",
+          "update_hash": "sha256:f2d3626041915bc4667944823d5e23d1e829f965e28f4f501ad38b5cb5adbb0c",
+          "applications": {
+            "gecko": {
+              "strict_min_version": "128.0"
+            }
+          }
+        }
+      ]
+    }
+  }
+}
