@@ -398,12 +398,10 @@
       return true;
     }
 
-    async getItems(itemFilter, count, rangeStart, rangeEnd) {
-      const items = await this.store.getItems(itemFilter, count, rangeStart, rangeEnd);
-      for (const item of items) {
-        adoptForCalendar(this, item);
-      }
-      return items;
+    // Thunderbird 128+ expects a ReadableStream<calIItemBase> here (not a
+    // Promise of an array), so hand the store's stream straight through.
+    getItems(itemFilter, count, rangeStart, rangeEnd) {
+      return this.store.getItems(itemFilter, count, rangeStart, rangeEnd);
     }
 
     async getItem(id) {
