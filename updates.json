@@ -31,6 +31,16 @@
               "strict_min_version": "128.0"
             }
           }
+        },
+        {
+          "version": "0.4.13",
+          "update_link": "https://github.com/zgasparian/exchange-calendar-sync/releases/download/v0.4.13/exchange-calendar-sync-0.4.13.xpi",
+          "update_hash": "sha256:2d5feab57c67a0a0f48ed97c0236fc084ba962b61bee063074b7a741fda1afba",
+          "applications": {
+            "gecko": {
+              "strict_min_version": "128.0"
+            }
+          }
         }
       ]
     }
