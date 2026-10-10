@@ -59,6 +59,9 @@ Graph has no on-premises equivalent, so this rewrite talks EWS instead.
 
 ## Changelog
 
+### 0.4.13
+- **Event status now reflects Exchange.** Previously every non-cancelled event was `STATUS:CONFIRMED`. Events you answered *Tentative* (`MyResponseType`) or that are shown as *Tentative* in free/busy (`LegacyFreeBusyStatus`) now show as Tentative in Thunderbird; cancelled events stay Cancelled. Your Accept / Decline response is shown through the invitation buttons (attendee participation status), since iCalendar's event STATUS has no accepted/declined value.
+
 ### 0.4.12
 - **Fixed events disappearing when scrolling between months.** Since 0.4.8, `getItems` awaited the store's result as if it were an array, but Thunderbird 128+ expects a `ReadableStream`, so any view refresh (changing month/week) came back empty. It now returns the stream unchanged, as in 0.4.7 and earlier.
 

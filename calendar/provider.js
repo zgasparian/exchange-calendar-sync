@@ -188,6 +188,13 @@
       if (!categories.includes(CANCELLED_CATEGORY)) {
         categories.push(CANCELLED_CATEGORY);
       }
+    } else if (simple.myResponseType === "Tentative" || simple.freeBusyStatus === "Tentative") {
+      // EWS has no STATUS field of its own: MyResponseType (Unknown /
+      // Organizer / Tentative / Accept / Decline / NoResponseReceived) and
+      // LegacyFreeBusyStatus (Free / Tentative / Busy / OOF /
+      // WorkingElsewhere / NoData) are what Outlook shows. Tentative in
+      // either one is the only value that maps onto iCalendar STATUS.
+      event.status = "TENTATIVE";
     } else {
       event.status = "CONFIRMED";
     }
