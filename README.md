@@ -27,22 +27,7 @@ An earlier version of this extension used Microsoft Graph + OAuth2, which
 only works against Exchange **Online** (Microsoft 365). That's gone now —
 Graph has no on-premises equivalent, so this rewrite talks EWS instead.
 
-## Changelog
-
-### 0.4.7
-- Accept / Tentative / Decline now show in Thunderbird's event dialog for invitations. The calendar owner email is resolved and stored as `organizerId`, and each invitation is marked with the invited attendee so Thunderbird's native buttons appear. A toolbar button opens the add-on options page.
-
-### 0.4.6
-- Improved **Accept / Decline / Tentative** support for meeting invitations.
-  - After responding, the extension refreshes the item from EWS so the local ChangeKey and response status stay in sync.
-  - MyResponseType is mapped onto the attendee participation status so Thunderbird shows the correct state.
-  - You can use Thunderbird's native Accept / Decline / Tentative buttons on an invitation; the change is pushed to the Exchange server.
-
-### 0.4.5
-- **Fixed new event sync**: CreateItem responses often contain only the ItemId. The extension now follows up with GetItem (with a fallback merge) so the full event is stored locally. Temporary local items created by Thunderbird are cleaned up after a successful server create. Dates are normalized (especially for all-day events) before being sent to EWS.
-
-### 0.4.4
-- Previous release.
+## Features
 
 - Two-way sync of events (create/edit/delete) between Thunderbird and an
   on-prem Exchange calendar.
@@ -71,6 +56,31 @@ Graph has no on-premises equivalent, so this rewrite talks EWS instead.
   delegated calendars from a *different* mailbox aren't supported.
 - Configurable sync interval, last-synced timestamps, encrypted credential
   storage — see below.
+
+## Changelog
+
+### 0.4.8
+- **Sync fixes.** Events created in Thunderbird now sync cleanly to Exchange and come back complete:
+  - `CreateItem` only returns an ItemId, so the add-on follows up with `GetItem` and stores the full server copy; the temporary local item Thunderbird created is removed so no duplicate or empty placeholder is left behind.
+  - Start/end times are sent to EWS as clean UTC (`...Z`, no fractional seconds); all-day events are normalized to midnight with an exclusive end date.
+  - Attendees without an email address are skipped instead of being stored as broken `mailto:` entries.
+  - The calendar's `getItems` / `getItem` now attach each item to its calendar, which the invitation UI needs.
+- **Packaging.** The add-on ID changed from `exchange-calendar-sync@example.invalid` to `exchange-calendar-sync@zareh.local`. Thunderbird treats this as a different add-on: **uninstall the old version before installing 0.4.8**, then re-enter the account credentials.
+
+### 0.4.7
+- Accept / Tentative / Decline now show in Thunderbird's event dialog for invitations. The calendar owner email is resolved (via EWS `ResolveNames` for `DOMAIN\user` logins) and stored as `organizerId`, and each invitation is marked with the invited attendee (`X-MOZ-INVITED-ATTENDEE`) so Thunderbird's native buttons appear. A toolbar button opens the add-on options page.
+
+### 0.4.6
+- Improved **Accept / Decline / Tentative** support for meeting invitations.
+  - After responding, the extension refreshes the item from EWS so the local ChangeKey and response status stay in sync.
+  - `MyResponseType` is mapped onto the attendee participation status so Thunderbird shows the correct state.
+  - You can use Thunderbird's native Accept / Decline / Tentative buttons on an invitation; the change is pushed to the Exchange server.
+
+### 0.4.5
+- **Fixed new event sync**: `CreateItem` responses often contain only the ItemId. The extension now follows up with `GetItem` (with a fallback merge) so the full event is stored locally. Temporary local items created by Thunderbird are cleaned up after a successful server create. Dates are normalized (especially for all-day events) before being sent to EWS.
+
+### 0.4.4
+- Previous release.
 
 ## Architecture
 
