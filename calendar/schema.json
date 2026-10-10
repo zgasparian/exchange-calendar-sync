@@ -10,7 +10,8 @@
         "async": true,
         "parameters": [
           { "name": "calendarKey", "type": "string" },
-          { "name": "displayName", "type": "string" }
+          { "name": "displayName", "type": "string" },
+          { "name": "ownerEmail", "type": "string", "optional": true }
         ]
       },
       {

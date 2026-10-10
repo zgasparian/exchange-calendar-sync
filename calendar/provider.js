@@ -116,6 +116,22 @@
     return description;
   }
 
+  function ewsResponseToPartStat(responseType) {
+    switch (responseType) {
+      case "Accept":
+      case "ACCEPTED":
+        return "ACCEPTED";
+      case "Decline":
+      case "DECLINED":
+        return "DECLINED";
+      case "Tentative":
+      case "TENTATIVE":
+        return "TENTATIVE";
+      default:
+        return "NEEDS-ACTION";
+    }
+  }
+
   function simpleToCalEvent(simple) {
     const event = new CalEvent();
     event.id = simple.id;
@@ -137,7 +153,11 @@
       organizer.isOrganizer = true;
       event.organizer = organizer;
     }
+
     for (const a of simple.attendees || []) {
+      if (!a.email) {
+        continue;
+      }
       const attendee = new CalAttendee();
       attendee.id = `mailto:${a.email}`;
       attendee.commonName = a.name;
@@ -192,15 +212,64 @@
     return event;
   }
 
+  /**
+   * Thunderbird shows Accept / Tentative / Decline only when it can find
+   * "the invited attendee": either the property X-MOZ-INVITED-ATTENDEE on
+   * the item, or calendar.organizerId matched against an attendee who is
+   * not the organizer. Stamp both.
+   */
+  function stampInvitation(calendar, event, simple) {
+    const organizerId = calendar.getProperty("organizerId");
+    if (!organizerId || !event.organizer) {
+      return;
+    }
+    const owner = organizerId.toLowerCase();
+    if ((event.organizer.id || "").toLowerCase() === owner) {
+      return;
+    }
+    const status = simple?.myResponseType ? ewsResponseToPartStat(simple.myResponseType) : null;
+    const attendees = event.getAttendees();
+    let match = null;
+    event.removeAllAttendees();
+    for (const att of attendees) {
+      if ((att.id || "").toLowerCase() === owner) {
+        if (status) {
+          att.participationStatus = status;
+        }
+        match = att;
+      }
+      event.addAttendee(att);
+    }
+    if (match) {
+      event.setProperty("X-MOZ-INVITED-ATTENDEE", match.id);
+    }
+  }
+
+  function adoptForCalendar(calendar, item) {
+    try {
+      item.calendar = calendar;
+    } catch (e) {
+      /* stored items are sometimes immutable; the property stamp still works */
+    }
+    return item;
+  }
+
   function calEventToSimple(event) {
+    const toCleanISO = (calDate) => {
+      if (!calDate) return null;
+      const utc = calDate.getInTimezone(cal.dtz.UTC);
+      const js = cal.dtz.dateTimeToJsDate(utc);
+      return js.toISOString().replace(/\.\d{3}Z$/, "Z");
+    };
+
     return {
       id: event.id,
       changeKey: event.getProperty("X-EWS-CHANGEKEY") || null,
       title: event.title || "",
       description: event.descriptionText || "",
       location: event.getProperty("LOCATION") || null,
-      startISO: cal.dtz.toRFC3339(event.startDate.getInTimezone(cal.dtz.UTC)),
-      endISO: cal.dtz.toRFC3339(event.endDate.getInTimezone(cal.dtz.UTC)),
+      startISO: toCleanISO(event.startDate),
+      endISO: toCleanISO(event.endDate),
       isAllDay: !!event.startDate.isDate,
       organizer: event.organizer
         ? { name: event.organizer.commonName, email: (event.organizer.id || "").replace(/^mailto:/i, "") }
@@ -292,12 +361,54 @@
       return false;
     }
 
-    getItems(itemFilter, count, rangeStart, rangeEnd) {
-      return this.store.getItems(itemFilter, count, rangeStart, rangeEnd);
+    // Thunderbird's invitation bar calls supportsScheduling, then
+    // getSchedulingSupport().getInvitedAttendee(). Without this the
+    // Accept / Tentative / Decline row stays hidden.
+    get supportsScheduling() {
+      return !!this.getProperty("organizerId");
+    }
+    getSchedulingSupport() {
+      return this;
+    }
+    getInvitedAttendee(aItem) {
+      const preset = aItem.getProperty("X-MOZ-INVITED-ATTENDEE");
+      if (preset) {
+        const found = aItem.getAttendeeById(preset);
+        if (found) {
+          return found;
+        }
+      }
+      const id = (this.getProperty("organizerId") || "").toLowerCase();
+      if (!id || !aItem.organizer) {
+        return null;
+      }
+      if ((aItem.organizer.id || "").toLowerCase() === id) {
+        return null;
+      }
+      for (const att of aItem.getAttendees()) {
+        if ((att.id || "").toLowerCase() === id) {
+          return att;
+        }
+      }
+      return null;
+    }
+    canNotify() {
+      // The Exchange server sends the meeting response. Returning true
+      // stops Thunderbird from also trying to send its own iTIP email.
+      return true;
+    }
+
+    async getItems(itemFilter, count, rangeStart, rangeEnd) {
+      const items = await this.store.getItems(itemFilter, count, rangeStart, rangeEnd);
+      for (const item of items) {
+        adoptForCalendar(this, item);
+      }
+      return items;
     }
 
     async getItem(id) {
-      return this.store.getItem(id);
+      const item = await this.store.getItem(id);
+      return item ? adoptForCalendar(this, item) : null;
     }
 
     async applyRemoteChange(change) {
@@ -310,6 +421,8 @@
         return;
       }
       const calEvent = simpleToCalEvent(item);
+      stampInvitation(this, calEvent, item);
+      adoptForCalendar(this, calEvent);
       if (existing) {
         await this.store.modifyItem(calEvent, existing);
       } else {
@@ -358,7 +471,23 @@
         return null;
       }
 
+      // For adds, the original item usually has a temporary local id.
+      // After the server assigns a real ItemId we must remove the temporary
+      // one so the view doesn't show a duplicate or a broken placeholder.
+      if (op === "add" && item.id && resultSimple?.id && item.id !== resultSimple.id) {
+        try {
+          const temp = await this.store.getItem(item.id);
+          if (temp) {
+            await this.store.deleteItem(temp);
+          }
+        } catch (e) {
+          console.warn("exchangeCalendar: could not remove temporary local item", e);
+        }
+      }
+
       const calEvent = simpleToCalEvent(resultSimple);
+      stampInvitation(this, calEvent, resultSimple);
+      adoptForCalendar(this, calEvent);
       const existing = await this.store.getItem(calEvent.id);
       if (existing) {
         return this.store.modifyItem(calEvent, existing);
@@ -422,14 +551,27 @@
     getAPI(context) {
       return {
         exchangeCalendar: {
-          async registerCalendar(calendarKey, displayName) {
+          async registerCalendar(calendarKey, displayName, ownerEmail) {
+            const applyOwner = calendar => {
+              if (!ownerEmail || !ownerEmail.includes("@")) {
+                return;
+              }
+              const mailto = ownerEmail.toLowerCase().startsWith("mailto:")
+                ? ownerEmail
+                : `mailto:${ownerEmail}`;
+              calendar.setProperty("organizerId", mailto);
+              calendar.setProperty("organizerCN", ownerEmail);
+              calendar.setProperty("imip.identity.disabled", false);
+            };
             let calendar = calendarsByKey.get(calendarKey);
             if (calendar) {
               calendar.name = displayName;
+              applyOwner(calendar);
               return { calendarId: calendar.id, wasStoreReset: !!calendar.wasStoreReset };
             }
             calendar = new ExchangeEwsCalendar();
             calendar.setProperty("exchangeCalendarKey", calendarKey);
+            applyOwner(calendar);
             calendar.name = displayName;
             calendar.uri = Services.io.newURI(`exchangeewssync://${encodeURIComponent(calendarKey)}/`);
             cal.manager.registerCalendar(calendar);

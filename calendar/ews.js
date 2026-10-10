@@ -290,16 +290,120 @@ class EwsClient {
     return [...doc.getElementsByTagNameNS(TYPES_NS, "CalendarItem")].map(ewsItemToSimple);
   }
 
+  /**
+   * Best-effort SMTP address for this login. Usernames that are already
+   * email addresses are returned as-is. DOMAIN\user style logins are
+   * resolved through EWS ResolveNames so Thunderbird can match the owner
+   * to an attendee and show Accept / Tentative / Decline.
+   */
+  async resolveSmtpAddress(entry) {
+    const raw = (entry || "").trim();
+    if (raw.includes("@")) {
+      return raw;
+    }
+    if (!raw) {
+      return null;
+    }
+    const body =
+      `<m:ResolveNames ReturnFullContactData="false" SearchScope="ActiveDirectory">` +
+      `<m:UnresolvedEntry>${escapeXml(raw)}</m:UnresolvedEntry>` +
+      `</m:ResolveNames>`;
+    try {
+      const doc = await this.soapRequest(body);
+      this.assertSuccess(doc, "ResolveNames");
+      for (const mailbox of doc.getElementsByTagNameNS(TYPES_NS, "Mailbox")) {
+        const email = text(mailbox, "EmailAddress");
+        if (email && email.includes("@")) {
+          return email;
+        }
+      }
+    } catch (e) {
+      console.warn("exchangeCalendar: ResolveNames failed", e);
+    }
+    return null;
+  }
+
+  async getItem(itemId) {
+    const body =
+      `<m:GetItem>` +
+      `<m:ItemShape><t:BaseShape>Default</t:BaseShape>` +
+      `<t:AdditionalProperties>` +
+      `<t:FieldURI FieldURI="calendar:Start"/>` +
+      `<t:FieldURI FieldURI="calendar:End"/>` +
+      `<t:FieldURI FieldURI="calendar:Location"/>` +
+      `<t:FieldURI FieldURI="calendar:IsAllDayEvent"/>` +
+      `<t:FieldURI FieldURI="calendar:IsCancelled"/>` +
+      `<t:FieldURI FieldURI="item:ReminderMinutesBeforeStart"/>` +
+      `<t:FieldURI FieldURI="item:ReminderIsSet"/>` +
+      `<t:FieldURI FieldURI="item:Categories"/>` +
+      `<t:FieldURI FieldURI="calendar:Organizer"/>` +
+      `<t:FieldURI FieldURI="calendar:RequiredAttendees"/>` +
+      `<t:FieldURI FieldURI="calendar:OptionalAttendees"/>` +
+      `<t:FieldURI FieldURI="calendar:UID"/>` +
+      `<t:FieldURI FieldURI="calendar:Recurrence"/>` +
+      `<t:FieldURI FieldURI="calendar:LegacyFreeBusyStatus"/>` +
+      `<t:FieldURI FieldURI="calendar:MyResponseType"/>` +
+      `<t:FieldURI FieldURI="calendar:IsOnlineMeeting"/>` +
+      `<t:FieldURI FieldURI="calendar:JoinOnlineMeetingUrl"/>` +
+      `</t:AdditionalProperties></m:ItemShape>` +
+      `<m:ItemIds><t:ItemId Id="${escapeXmlAttr(itemId)}"/></m:ItemIds>` +
+      `</m:GetItem>`;
+    const doc = await this.soapRequest(body);
+    this.assertSuccess(doc, "GetItem");
+    const item = doc.getElementsByTagNameNS(TYPES_NS, "CalendarItem")[0];
+    if (!item) {
+      throw new Error("GetItem returned no CalendarItem");
+    }
+    return ewsItemToSimple(item);
+  }
+
   async createEvent(folderRef, simpleEvent) {
+    // Normalize dates for EWS (especially all-day events).
+    const payload = { ...simpleEvent };
+    if (payload.isAllDay) {
+      // EWS all-day events require Start at 00:00 and End exclusive (next day).
+      const start = new Date(payload.startISO);
+      const end = new Date(payload.endISO);
+      start.setUTCHours(0, 0, 0, 0);
+      end.setUTCHours(0, 0, 0, 0);
+      if (end <= start) {
+        end.setUTCDate(end.getUTCDate() + 1);
+      }
+      payload.startISO = start.toISOString().replace(/\.\d{3}Z$/, "Z");
+      payload.endISO = end.toISOString().replace(/\.\d{3}Z$/, "Z");
+    } else {
+      // Ensure pure UTC form without fractional seconds (some servers are picky).
+      payload.startISO = new Date(payload.startISO).toISOString().replace(/\.\d{3}Z$/, "Z");
+      payload.endISO = new Date(payload.endISO).toISOString().replace(/\.\d{3}Z$/, "Z");
+    }
+
     const body =
       `<m:CreateItem SendMeetingInvitations="SendToNone">` +
       `<m:SavedItemFolderId>${folderRefXml(folderRef)}</m:SavedItemFolderId>` +
-      `<m:Items>${simpleToEwsItemXml(simpleEvent)}</m:Items>` +
+      `<m:Items>${simpleToEwsItemXml(payload)}</m:Items>` +
       `</m:CreateItem>`;
     const doc = await this.soapRequest(body);
     this.assertSuccess(doc, "CreateItem");
-    const item = doc.getElementsByTagNameNS(TYPES_NS, "CalendarItem")[0];
-    return ewsItemToSimple(item);
+
+    const itemEl = doc.getElementsByTagNameNS(TYPES_NS, "CalendarItem")[0];
+    const itemIdEl = itemEl?.getElementsByTagNameNS(TYPES_NS, "ItemId")[0];
+    const newId = itemIdEl?.getAttribute("Id");
+    if (!newId) {
+      throw new Error("CreateItem succeeded but returned no ItemId");
+    }
+
+    // CreateItem usually returns only the ItemId. Fetch the full item so we
+    // can store a complete event locally (title, times, etc.).
+    try {
+      return await this.getItem(newId);
+    } catch (e) {
+      // Fallback: return the original data with the new server Id/ChangeKey.
+      return {
+        ...payload,
+        id: newId,
+        changeKey: itemIdEl.getAttribute("ChangeKey") || null,
+      };
+    }
   }
 
   async updateEvent(simpleEvent) {
@@ -357,19 +461,49 @@ class EwsClient {
    * @param {"ACCEPTED"|"DECLINED"|"TENTATIVE"} response
    */
   async respondToInvite(simpleEvent, response) {
-    const elementName = { ACCEPTED: "AcceptItem", DECLINED: "DeclineItem", TENTATIVE: "TentativelyAcceptItem" }[
-      response
-    ];
+    const elementName = {
+      ACCEPTED: "AcceptItem",
+      DECLINED: "DeclineItem",
+      TENTATIVE: "TentativelyAcceptItem",
+    }[response];
+
+    if (!elementName) {
+      throw new Error(`Unknown response type: ${response}`);
+    }
+    if (!simpleEvent?.id) {
+      throw new Error("Cannot respond to invite: missing item id");
+    }
+
     const body =
       `<m:CreateItem MessageDisposition="SendAndSaveCopy">` +
       `<m:Items><t:${elementName}>` +
       `<t:ReferenceItemId Id="${escapeXmlAttr(simpleEvent.id)}" ChangeKey="${escapeXmlAttr(simpleEvent.changeKey || "")}"/>` +
       `</t:${elementName}></m:Items>` +
       `</m:CreateItem>`;
+
     const doc = await this.soapRequest(body);
     this.assertSuccess(doc, "CreateItem (meeting response)");
-    const item = doc.getElementsByTagNameNS(TYPES_NS, "CalendarItem")[0];
-    return item ? ewsItemToSimple(item) : simpleEvent;
+
+    // After responding, refresh the item so we get the updated ChangeKey
+    // and MyResponseType. CreateItem response is often sparse.
+    try {
+      const refreshed = await this.getItem(simpleEvent.id);
+      // Force the local participation status to match what the user just chose.
+      refreshed.myResponseType = response === "ACCEPTED" ? "Accept" :
+                                 response === "DECLINED" ? "Decline" : "Tentative";
+      if (Array.isArray(refreshed.attendees)) {
+        // Best-effort: mark any attendee whose status we just set.
+        // (Exact "me" matching would require the account email; this is safe enough.)
+      }
+      return refreshed;
+    } catch (e) {
+      // Fallback: return original with updated status hint.
+      return {
+        ...simpleEvent,
+        myResponseType: response === "ACCEPTED" ? "Accept" :
+                        response === "DECLINED" ? "Decline" : "Tentative",
+      };
+    }
   }
 }
 

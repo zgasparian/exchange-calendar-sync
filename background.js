@@ -30,6 +30,12 @@
 
 const SYNC_ALARM = "exchangeCalendarSync";
 
+if (browser.browserAction && browser.browserAction.onClicked) {
+  browser.browserAction.onClicked.addListener(() => {
+    browser.runtime.openOptionsPage();
+  });
+}
+
 // accountId -> password, cached in memory only (never persisted here) so
 // the webRequest.onAuthRequired listener can answer NTLM/Negotiate/Basic
 // challenges without round-tripping through the Experiment API each time.
@@ -131,6 +137,28 @@ async function listFolders(accountId) {
   return annotateFolders(accountId, folders);
 }
 
+async function ensureOwnerEmail(accountId) {
+  const accounts = await getAccounts();
+  const account = accounts[accountId];
+  if (!account) {
+    return null;
+  }
+  if (account.smtpAddress && account.smtpAddress.includes("@")) {
+    return account.smtpAddress;
+  }
+  const password = passwordCache.get(accountId);
+  if (!password) {
+    return account.username?.includes("@") ? account.username : null;
+  }
+  const client = new EwsClient(account.url, account.username, password);
+  const smtp = await client.resolveSmtpAddress(account.username);
+  if (smtp) {
+    account.smtpAddress = smtp;
+    await saveAccounts(accounts);
+  }
+  return smtp || (account.username?.includes("@") ? account.username : null);
+}
+
 async function addCalendarInternal(accountId, folderRef, folderName) {
   const calendarKey = calendarKeyFor(accountId, folderRef);
   const calendars = await getCalendars();
@@ -145,7 +173,12 @@ async function addCalendarInternal(accountId, folderRef, folderName) {
   await saveCalendars(calendars);
 
   const accounts = await getAccounts();
-  await browser.exchangeCalendar.registerCalendar(calendarKey, `${accounts[accountId].displayName} — ${folderName}`);
+  const ownerEmail = await ensureOwnerEmail(accountId);
+  await browser.exchangeCalendar.registerCalendar(
+    calendarKey,
+    `${accounts[accountId].displayName} — ${folderName}`,
+    ownerEmail || ""
+  );
   await syncCalendar(calendarKey); // isInitialSync inside suppresses notifications for this first pass
   return calendarKey;
 }
@@ -312,16 +345,24 @@ async function restoreOnStartup() {
     } else {
       passwordCache.set(accountId, credentials.password);
       registerAuthHandler(accountId, account.url, account.username);
+      try {
+        await ensureOwnerEmail(accountId);
+      } catch (e) {
+        console.warn("exchangeCalendar: could not resolve owner email", e);
+      }
     }
   }
   await saveAccounts(accounts);
 
+  const freshAccounts = await getAccounts();
   const calendars = await getCalendars();
   for (const [calendarKey, calendar] of Object.entries(calendars)) {
-    const account = accounts[calendar.accountId];
+    const account = freshAccounts[calendar.accountId];
+    const ownerEmail = account?.smtpAddress || (account?.username?.includes("@") ? account.username : "");
     const { wasStoreReset } = await browser.exchangeCalendar.registerCalendar(
       calendarKey,
-      `${account?.displayName ?? calendar.accountId} — ${calendar.folderName}`
+      `${account?.displayName ?? calendar.accountId} — ${calendar.folderName}`,
+      ownerEmail
     );
     if (wasStoreReset) {
       // The on-disk calendar store was just (re)created — e.g. upgrading

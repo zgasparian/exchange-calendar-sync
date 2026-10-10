@@ -27,7 +27,22 @@ An earlier version of this extension used Microsoft Graph + OAuth2, which
 only works against Exchange **Online** (Microsoft 365). That's gone now —
 Graph has no on-premises equivalent, so this rewrite talks EWS instead.
 
-## Features
+## Changelog
+
+### 0.4.7
+- Accept / Tentative / Decline now show in Thunderbird's event dialog for invitations. The calendar owner email is resolved and stored as `organizerId`, and each invitation is marked with the invited attendee so Thunderbird's native buttons appear. A toolbar button opens the add-on options page.
+
+### 0.4.6
+- Improved **Accept / Decline / Tentative** support for meeting invitations.
+  - After responding, the extension refreshes the item from EWS so the local ChangeKey and response status stay in sync.
+  - MyResponseType is mapped onto the attendee participation status so Thunderbird shows the correct state.
+  - You can use Thunderbird's native Accept / Decline / Tentative buttons on an invitation; the change is pushed to the Exchange server.
+
+### 0.4.5
+- **Fixed new event sync**: CreateItem responses often contain only the ItemId. The extension now follows up with GetItem (with a fallback merge) so the full event is stored locally. Temporary local items created by Thunderbird are cleaned up after a successful server create. Dates are normalized (especially for all-day events) before being sent to EWS.
+
+### 0.4.4
+- Previous release.
 
 - Two-way sync of events (create/edit/delete) between Thunderbird and an
   on-prem Exchange calendar.
