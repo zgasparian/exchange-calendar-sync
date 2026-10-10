@@ -59,6 +59,9 @@ Graph has no on-premises equivalent, so this rewrite talks EWS instead.
 
 ## Changelog
 
+### 0.4.11
+- **Sync robustness:** one event that fails to import no longer aborts the whole batch (previously every event after it silently never synced). Failures are logged and retried on the next sync, and the sync log line now reports a `failed` count.
+
 ### 0.4.10
 - **Automatic updates.** The manifest now has an `update_url` pointing at `updates.json` in this repo, which the release workflow regenerates on every tagged release. Thunderbird checks it periodically and offers new versions from GitHub. Installs older than 0.4.10 have no update URL, so install 0.4.10 manually once.
 
