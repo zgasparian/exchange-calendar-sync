@@ -491,10 +491,6 @@ class EwsClient {
       // Force the local participation status to match what the user just chose.
       refreshed.myResponseType = response === "ACCEPTED" ? "Accept" :
                                  response === "DECLINED" ? "Decline" : "Tentative";
-      if (Array.isArray(refreshed.attendees)) {
-        // Best-effort: mark any attendee whose status we just set.
-        // (Exact "me" matching would require the account email; this is safe enough.)
-      }
       return refreshed;
     } catch (e) {
       // Fallback: return original with updated status hint.

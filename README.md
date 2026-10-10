@@ -59,6 +59,9 @@ Graph has no on-premises equivalent, so this rewrite talks EWS instead.
 
 ## Changelog
 
+### 0.4.9
+- Cleanup only: removed a dead no-op block in `respondToInvite` and the duplicate `browser_specific_settings` entry in the manifest (the add-on ID is unchanged from 0.4.8).
+
 ### 0.4.8
 - **Sync fixes.** Events created in Thunderbird now sync cleanly to Exchange and come back complete:
   - `CreateItem` only returns an ItemId, so the add-on follows up with `GetItem` and stores the full server copy; the temporary local item Thunderbird created is removed so no duplicate or empty placeholder is left behind.
