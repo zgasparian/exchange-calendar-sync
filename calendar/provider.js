@@ -616,14 +616,24 @@
             if (!calendar) {
               throw new Error(`exchangeCalendar: no registered calendar for ${calendarKey}`);
             }
+            // One bad item must not abort the rest of the batch (it used to,
+            // so every item after it silently never synced). Failures are
+            // returned so background.js can retry them on the next sync.
+            const failedIds = [];
             calendar.startBatch();
             try {
               for (const change of changes) {
-                await calendar.applyRemoteChange(change);
+                try {
+                  await calendar.applyRemoteChange(change);
+                } catch (e) {
+                  console.error(`exchangeCalendar: could not apply ${change.op} for ${change.item?.id}`, e);
+                  failedIds.push(change.item?.id);
+                }
               }
             } finally {
               calendar.endBatch();
             }
+            return failedIds;
           },
 
           async resolveLocalChange(requestId, resultItem) {

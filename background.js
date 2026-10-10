@@ -255,13 +255,28 @@ async function syncCalendar(calendarKey) {
         changes.push({ op: "delete", item: { id, removed: true } });
       }
     }
+    let failedIds = [];
     if (changes.length) {
-      await browser.exchangeCalendar.applyRemoteChanges(calendarKey, changes);
+      failedIds = (await browser.exchangeCalendar.applyRemoteChanges(calendarKey, changes)) || [];
       if (!isInitialSync) {
-        notifyForChanges(calendar, changes);
+        notifyForChanges(
+          calendar,
+          changes.filter(c => !failedIds.includes(c.item.id))
+        );
       }
     }
-    console.log(`exchangeCalendar: ${calendarKey} synced ${items.length} occurrences, ${changes.length} changes`);
+    // Items that failed to apply are left out of (or kept at their old
+    // value in) knownEvents so the next sync retries them.
+    for (const id of failedIds) {
+      if (id in known) {
+        nextKnown[id] = known[id];
+      } else {
+        delete nextKnown[id];
+      }
+    }
+    console.log(
+      `exchangeCalendar: ${calendarKey} synced ${items.length} occurrences, ${changes.length} changes, ${failedIds.length} failed`
+    );
     calendar.knownEvents = nextKnown;
     calendar.needsReauth = false;
     calendar.lastSyncedAt = Date.now();
