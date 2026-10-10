@@ -34,10 +34,35 @@ jobs:
       - name: Build xpi
         run: |
           zip -r -X "exchange-calendar-sync-${{ steps.manifest.outputs.version }}.xpi" . \
-            -x ".git/*" ".github/*" ".gitignore"
+            -x ".git/*" ".github/*" ".gitignore" "updates.json"
 
       - name: Create release and attach xpi
         uses: softprops/action-gh-release@v2
         with:
           files: exchange-calendar-sync-*.xpi
           generate_release_notes: true
+
+      # Publish the update manifest Thunderbird polls (manifest.json's
+      # update_url), so installed copies can update from this release.
+      - name: Update updates.json on main
+        run: |
+          version="${{ steps.manifest.outputs.version }}"
+          id="$(jq -r '.applications.gecko.id' manifest.json)"
+          min="$(jq -r '.applications.gecko.strict_min_version' manifest.json)"
+          file="exchange-calendar-sync-${version}.xpi"
+          hash="sha256:$(sha256sum "$file" | cut -d' ' -f1)"
+          link="https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/${file}"
+          git fetch origin main
+          git checkout -f main
+          [ -f updates.json ] || echo '{"addons":{}}' > updates.json
+          jq --arg id "$id" --arg v "$version" --arg link "$link" --arg hash "$hash" --arg min "$min" '
+            .addons[$id].updates = (
+              [(.addons[$id].updates // [])[] | select(.version != $v)]
+              + [{version: $v, update_link: $link, update_hash: $hash,
+                  applications: {gecko: {strict_min_version: $min}}}]
+            )' updates.json > updates.tmp && mv updates.tmp updates.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add updates.json
+          git commit -m "updates.json: ${version}" || exit 0
+          git push origin main

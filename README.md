@@ -59,6 +59,9 @@ Graph has no on-premises equivalent, so this rewrite talks EWS instead.
 
 ## Changelog
 
+### 0.4.10
+- **Automatic updates.** The manifest now has an `update_url` pointing at `updates.json` in this repo, which the release workflow regenerates on every tagged release. Thunderbird checks it periodically and offers new versions from GitHub. Installs older than 0.4.10 have no update URL, so install 0.4.10 manually once.
+
 ### 0.4.9
 - Cleanup only: removed a dead no-op block in `respondToInvite` and the duplicate `browser_specific_settings` entry in the manifest (the add-on ID is unchanged from 0.4.8).
 
@@ -84,6 +87,17 @@ Graph has no on-premises equivalent, so this rewrite talks EWS instead.
 
 ### 0.4.4
 - Previous release.
+
+## Updating
+
+Thunderbird checks `updates.json` (from `update_url` in `manifest.json`) on
+its normal add-on update schedule, or on demand via *Add-ons Manager → gear
+icon → Check for Updates*. Each tagged release (`vX.Y.Z`, matching
+`manifest.json`) builds the `.xpi`, attaches it to the GitHub release, and
+commits a new entry (URL + SHA-256) to `updates.json`.
+
+Note: this only works if your Thunderbird accepts this unsigned add-on in
+the first place (e.g. `xpinstall.signatures.required` set to `false`).
 
 ## Architecture
 

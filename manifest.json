@@ -1,12 +1,13 @@
 {
   "manifest_version": 2,
   "name": "Exchange Calendar Sync",
-  "version": "0.4.9",
+  "version": "0.4.10",
   "description": "Two-way sync between an on-premises Exchange Server calendar and Thunderbird, via EWS.",
   "author": "Zareh Kasparian",
   "applications": {
     "gecko": {
       "id": "exchange-calendar-sync@zareh.local",
+      "update_url": "https://raw.githubusercontent.com/zgasparian/exchange-calendar-sync/main/updates.json",
       "strict_min_version": "128.0"
     }
   },
